@@ -2992,6 +2992,171 @@ class TestDissectMoqt:
         assert self._matching_frames(
             cmd_tshark, capture_path, test_env, '_ws.malformed') == ['4']
 
+    @staticmethod
+    def _qv(value):
+        '''Encode a QUIC variable-length integer, as draft 16 uses.'''
+        for length, prefix in ((1, 0), (2, 0x40), (4, 0x80), (8, 0xc0)):
+            if value < 1 << (8 * length - 2):
+                encoded = bytearray(value.to_bytes(length, 'big'))
+                encoded[0] |= prefix
+                return bytes(encoded)
+        raise ValueError(value)
+
+    @classmethod
+    def _d16_message(cls, message_type, payload):
+        return cls._qv(message_type) + len(payload).to_bytes(2, 'big') + payload
+
+    @classmethod
+    def _d16_namespace(cls, fields):
+        return (cls._qv(len(fields)) +
+                b''.join(cls._qv(len(field)) + field for field in fields))
+
+    @classmethod
+    def _d16_parameters(cls, entries):
+        previous_type = 0
+        encoded = cls._qv(len(entries))
+        for parameter_type, value in entries:
+            encoded += cls._qv(parameter_type - previous_type) + value
+            previous_type = parameter_type
+        return encoded
+
+    def test_moqt_draft16_control_messages(
+            self, cmd_text2pcap, cmd_tshark, result_file,
+            base_env, test_env):
+        '''Draft 16 uses QUIC varints, Request IDs in responses and parity.'''
+        qv = self._qv
+        message = self._d16_message
+        parameters = self._d16_parameters
+        lp = lambda value: qv(len(value)) + value  # noqa: E731
+        track = self._d16_namespace((b'live',)) + qv(5) + b'video'
+
+        packets = (
+            message(0x20, qv(2) + qv(0x01) + lp(b'/moq') + qv(0x01) + qv(100)),
+            # The filter's End Group is absolute; 0x41 is unknown but odd.
+            message(0x03, qv(0) + track + parameters((
+                (0x02, qv(5000)),
+                (0x21, lp(qv(4) + qv(1) + qv(0) + qv(9))),
+                (0x41, lp(b'xy'))))),
+            message(0x04, qv(0) + qv(7) + parameters(())),
+            message(0x02, qv(2) + qv(0) + parameters(())),
+            message(0x0a, qv(0)),
+            message(0x15, qv(300)),
+            message(0x11, qv(4) + self._d16_namespace((b'live',)) + qv(2) +
+                    parameters(())),
+            message(0x0b, qv(0) + qv(5) + qv(1) + qv(0)),
+            message(0x10, qv(0)),
+        )
+        capture_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env,
+            'moqt-draft16-control', 'moqt', packets, draft=16)
+
+        fields = self._field_rows
+        assert fields(cmd_tshark, capture_path, test_env, 'moqt',
+                      ('moqt.draft', '_ws.col.info')) == [
+            ['16', 'CLIENT_SETUP'], ['16', 'SUBSCRIBE'], ['16', 'SUBSCRIBE_OK'],
+            ['16', 'REQUEST_UPDATE'], ['16', 'UNSUBSCRIBE'], ['16', 'MAX_REQUEST_ID'],
+            ['16', 'SUBSCRIBE_NAMESPACE (Both)'], ['16', 'PUBLISH_DONE (EXPIRED)'],
+            ['16', 'GOAWAY']]
+        assert fields(cmd_tshark, capture_path, test_env, 'frame.number == 1',
+                      ('moqt.setup.option.count', 'moqt.setup.option.type',
+                       'moqt.setup.option.integer')) == [['2', '1,2', '100']]
+        assert fields(cmd_tshark, capture_path, test_env, 'frame.number == 2',
+                      ('moqt.parameter.type', 'moqt.parameter.varint',
+                       'moqt.filter.type', 'moqt.group_id', 'moqt.filter.end_group',
+                       'moqt.parameter.value')) == [
+            ['2,33,65', '5000', '4', '1', '9', '7879']]
+        assert fields(cmd_tshark, capture_path, test_env, 'frame.number >= 3 && frame.number <= 6',
+                      ('moqt.request_id', 'moqt.track_alias', 'moqt.existing_request_id',
+                       'moqt.max_request_id')) == [
+            ['0', '7', '', ''], ['2', '', '0', ''], ['0', '', '', ''], ['', '', '', '300']]
+        assert self._matching_frames(
+            cmd_tshark, capture_path, test_env,
+            '_ws.malformed || _ws.expert.severity == error') == []
+
+    def test_moqt_draft16_data(
+            self, cmd_text2pcap, cmd_tshark, result_file,
+            base_env, test_env):
+        '''Draft 16 subgroup and FETCH streams and untyped datagrams.'''
+        qv = self._qv
+        subgroup = (qv(0x01) + qv(7) + qv(3) + qv(2) + bytes((0x80, 1)) +
+                    # Object 0: one Extension Header and a payload.
+                    qv(0) + qv(1) + qv(0x0c) + qv(30) + qv(3) + b'abc' +
+                    # Object 1: empty, with End of Group status.
+                    qv(1) + qv(0) + qv(0) + qv(3))
+        fetch = (qv(0x02) + qv(4) +
+                 qv(0x1f) + qv(9) + qv(1) + qv(4) + bytes((2,)) + qv(1) + b'z')
+        stream_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env,
+            'moqt-draft16-streams', 'moqt', (subgroup, fetch), draft=16)
+        datagram_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env,
+            'moqt-draft16-datagrams', 'moqt.datagram',
+            (qv(7) + qv(3) + qv(5) + bytes((1,)) + qv(0) + qv(0) + b'xyz',
+             qv(7) + qv(3) + qv(6) + bytes((1,)) + qv(0) + qv(5)), draft=16)
+
+        fields = self._field_rows
+        assert fields(cmd_tshark, stream_path, test_env, 'moqt',
+                      ('_ws.col.info', 'moqt.subgroup_id', 'moqt.object_id',
+                       'moqt.extensions.count', 'moqt.property.integer',
+                       'moqt.object.status', 'moqt.group_id')) == [
+            ['Subgroup Header (Track Alias 7, Group 3), Object 0, Object 1',
+             '2', '0,1', '1,0', '30', '3', '3'],
+            ['Fetch Header (Request ID 4), Fetch Object', '1', '4', '', '', '', '9']]
+        assert fields(cmd_tshark, datagram_path, test_env, 'moqt',
+                      ('_ws.col.info', 'moqt.object.status')) == [
+            ['Object Datagram (Track Alias 7, Group 3, Object 5, 3 bytes)', '0'],
+            ['Object Datagram (Track Alias 7, Group 3, Object 6, End of Track)', '5']]
+        for path in (stream_path, datagram_path):
+            assert self._matching_frames(
+                cmd_tshark, path, test_env,
+                '_ws.malformed || _ws.expert.severity == error') == []
+
+    def test_moqt_draft17(
+            self, cmd_text2pcap, cmd_tshark, result_file,
+            base_env, test_env):
+        '''Draft 17 Required Request ID Deltas and absolute FETCH IDs.'''
+        vi = self._vi64
+        namespace = self._namespace
+        parameters = self._parameters
+        lp = lambda value: vi(len(value)) + value  # noqa: E731
+        track = namespace((b'live',)) + vi(5) + b'video'
+
+        packets = (
+            self._message(0x2f00, self._key_values(((0x01, lp(b'/moq')),))),
+            self._message(0x03, vi(0) + vi(1) + track + parameters(((0x10, bytes((1,))),))),
+            self._message(0x11, vi(2) + vi(0) + namespace((b'live',)) + vi(1) +
+                          parameters(())),
+            self._message(0x1e, parameters(())),
+            self._message(0x05, vi(0x19) + vi(0) + vi(0)),
+            self._message(0x10, vi(0) + vi(100)),
+            # FETCH Object with absolute Group and Object IDs.
+            vi(0x05) + vi(4) + vi(0x0c) + vi(9) + vi(4) + vi(0),
+            # FIRST_OBJECT (0x40) is not a draft-17 subgroup bit.
+            vi(0x50) + vi(1) + vi(2),
+        )
+        capture_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env,
+            'moqt-draft17', 'moqt', packets, draft=17)
+
+        fields = self._field_rows
+        assert fields(cmd_tshark, capture_path, test_env, 'moqt',
+                      ('_ws.col.info', 'moqt.request_id',
+                       'moqt.required_request_id_delta', 'moqt.stream.unknown')) == [
+            ['SETUP', '', '', ''],
+            ['SUBSCRIBE', '0', '1', ''],
+            ['SUBSCRIBE_NAMESPACE (NAMESPACE)', '2', '0', ''],
+            ['PUBLISH_OK', '', '', ''],
+            ['REQUEST_ERROR (DUPLICATE_SUBSCRIPTION)', '', '', ''],
+            ['GOAWAY', '', '', ''],
+            ['Fetch Header (Request ID 4), Fetch Object', '4', '', ''],
+            ['', '', '', '1'],
+        ]
+        assert fields(cmd_tshark, capture_path, test_env, 'frame.number == 7',
+                      ('moqt.group_id', 'moqt.object_id', 'moqt.group_id_delta',
+                       'moqt.object_id_delta')) == [['9', '4', '', '']]
+        assert fields(cmd_tshark, capture_path, test_env, 'frame.number == 6',
+                      ('moqt.timeout',)) == [['100']]
+
     @pytest.mark.parametrize('draft', (18, 22))
     def test_moqt_immutable_properties(
             self, cmd_text2pcap, cmd_tshark, result_file,

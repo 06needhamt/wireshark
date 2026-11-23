@@ -1,6 +1,6 @@
 /* packet-moqt.c
  * Routines for Media over QUIC Transport (MOQT) dissection
- * draft-ietf-moq-transport-18 through -23
+ * draft-ietf-moq-transport-16 through -23
  *
  * Wireshark - Network traffic analyzer
  * By Gerald Combs <gerald@wireshark.org>
@@ -42,11 +42,28 @@
  *    FILL_PARAMETERS and INCLUDE_PROPERTIES, but its LOCATION_FILTER is
  *    length prefixed and lists only the fields present.
  *  - Draft 21 is an editorial restructure of draft 20, identical on the wire.
+ *
+ * Drafts 16 and 17 predate the draft-18 layouts:
+ *  - Draft 17 is draft 18 with a Required Request ID Delta after the Request
+ *    ID of each request, SUBSCRIBE_NAMESPACE at 0x11 with Subscribe Options,
+ *    PUBLISH_OK (0x1e), no REQUEST_ERROR Redirect, no PADDING streams, no
+ *    FIRST_OBJECT subgroup bit, absolute FETCH object IDs and a vi64 with no
+ *    7-byte form.
+ *  - Draft 16 uses QUIC varints, carries every control message on one
+ *    bidirectional stream with CLIENT_SETUP and SERVER_SETUP, puts the
+ *    Request ID in every response, and has the request flow control and
+ *    cancellation messages later drafts removed. Its Message Parameters follow
+ *    the Key-Value-Pair parity rule. Subgroup streams (0x01) have a fixed
+ *    header, objects carry absolute IDs and a counted Extension list, and
+ *    datagrams have no type.
+ * The draft-16 and -17 data layouts follow libloc, which implements them.
  */
 
 void proto_register_moqt(void);
 void proto_reg_handoff_moqt(void);
 
+#define MOQT_ALPN_DRAFT_16 "moqt-16"
+#define MOQT_ALPN_DRAFT_17 "moqt-17"
 #define MOQT_ALPN_DRAFT_18 "moqt-18"
 #define MOQT_ALPN_DRAFT_19 "moqt-19"
 #define MOQT_ALPN_DRAFT_20 "moqt-20"
@@ -74,6 +91,22 @@ void proto_reg_handoff_moqt(void);
 #define MOQT_MSG_SUBSCRIBE_NAMESPACE  0x50
 #define MOQT_MSG_SUBSCRIBE_TRACKS     0x51
 #define MOQT_MSG_SETUP                0x2f00
+/* Draft 16 only, apart from SUBSCRIBE_NAMESPACE (drafts 16 and 17). */
+#define MOQT_MSG_PUBLISH_NAMESPACE_DONE   0x09
+#define MOQT_MSG_UNSUBSCRIBE              0x0a
+#define MOQT_MSG_PUBLISH_NAMESPACE_CANCEL 0x0c
+#define MOQT_MSG_SUBSCRIBE_NAMESPACE_D16  0x11
+#define MOQT_MSG_MAX_REQUEST_ID           0x15
+#define MOQT_MSG_FETCH_CANCEL             0x17
+#define MOQT_MSG_REQUESTS_BLOCKED         0x1a
+#define MOQT_MSG_CLIENT_SETUP             0x20
+#define MOQT_MSG_SERVER_SETUP             0x21
+
+/* Draft 16 unidirectional stream types. */
+#define MOQT_DRAFT16_STREAM_SUBGROUP  0x01
+#define MOQT_DRAFT16_STREAM_FETCH     0x02
+/* Draft 17 has no FIRST_OBJECT bit. */
+#define MOQT_DRAFT17_SUBGROUP_DEFINED_BITS 0x3f
 
 #define MOQT_STREAM_FETCH             0x05
 #define MOQT_STREAM_PADDING           0x132b3e28
@@ -162,8 +195,8 @@ void proto_reg_handoff_moqt(void);
 
 static dissector_handle_t moqt_handle;              /* latest draft */
 static dissector_handle_t moqt_datagram_handle;
-static dissector_handle_t moqt_handles[6];          /* indexed as moqt_drafts */
-static dissector_handle_t moqt_datagram_handles[6];
+static dissector_handle_t moqt_handles[8];          /* indexed as moqt_drafts */
+static dissector_handle_t moqt_datagram_handles[8];
 
 static int proto_moqt;
 
@@ -172,6 +205,14 @@ static int hf_moqt_stream_type;
 static int hf_moqt_message_type;
 static int hf_moqt_message_length;
 static int hf_moqt_request_id;
+static int hf_moqt_required_request_id_delta;
+static int hf_moqt_existing_request_id;
+static int hf_moqt_max_request_id;
+static int hf_moqt_subscribe_options;
+static int hf_moqt_setup_option_count;
+static int hf_moqt_extension_count;
+static int hf_moqt_header_end_of_group;
+static int hf_moqt_end_group;
 static int hf_moqt_track_alias;
 static int hf_moqt_namespace_count;
 static int hf_moqt_namespace_field_length;
@@ -314,6 +355,17 @@ static const val64_string moqt_property_type_vals[] = {
     { 0, NULL }
 };
 
+/* Draft 16 Setup Parameters, including the Request ID flow-control limit. */
+static const val64_string moqt_draft16_setup_option_type_vals[] = {
+    { 0x01, "PATH" },
+    { 0x02, "MAX_REQUEST_ID" },
+    { MOQT_SETUP_AUTHORIZATION_TOKEN, "AUTHORIZATION_TOKEN" },
+    { 0x04, "MAX_AUTH_TOKEN_CACHE_SIZE" },
+    { 0x05, "AUTHORITY" },
+    { 0x07, "MOQT_IMPLEMENTATION" },
+    { 0, NULL }
+};
+
 static const val64_string moqt_draft22_setup_option_type_vals[] = {
     { 0x01, "PATH" },
     { MOQT_SETUP_AUTHORIZATION_TOKEN, "AUTHORIZATION_TOKEN" },
@@ -368,6 +420,44 @@ static const val64_string moqt_draft18_request_error_vals[] = {
     { 0x32, "INVALID_JOINING_REQUEST_ID" },
     { 0x33, "UNSUPPORTED_EXTENSION" },
     { MOQT_REQUEST_ERROR_REDIRECT, "REDIRECT" },
+    { 0, NULL }
+};
+
+/* Draft 16 has no GOING_AWAY, EXCESSIVE_LOAD or NAMESPACE_TOO_LARGE. */
+static const val64_string moqt_draft16_request_error_vals[] = {
+    { 0x00, "INTERNAL_ERROR" },
+    { 0x01, "UNAUTHORIZED" },
+    { 0x02, "TIMEOUT" },
+    { 0x03, "NOT_SUPPORTED" },
+    { 0x04, "MALFORMED_AUTH_TOKEN" },
+    { 0x05, "EXPIRED_AUTH_TOKEN" },
+    { 0x10, "DOES_NOT_EXIST" },
+    { 0x11, "INVALID_RANGE" },
+    { 0x12, "MALFORMED_TRACK" },
+    { 0x19, "DUPLICATE_SUBSCRIPTION" },
+    { 0x20, "UNINTERESTED" },
+    { 0x30, "PREFIX_OVERLAP" },
+    { 0x32, "INVALID_JOINING_REQUEST_ID" },
+    { 0, NULL }
+};
+
+static const val64_string moqt_draft17_request_error_vals[] = {
+    { 0x00, "INTERNAL_ERROR" },
+    { 0x01, "UNAUTHORIZED" },
+    { 0x02, "TIMEOUT" },
+    { 0x03, "NOT_SUPPORTED" },
+    { 0x04, "MALFORMED_AUTH_TOKEN" },
+    { 0x05, "EXPIRED_AUTH_TOKEN" },
+    { 0x06, "GOING_AWAY" },
+    { 0x09, "EXCESSIVE_LOAD" },
+    { 0x10, "DOES_NOT_EXIST" },
+    { 0x11, "INVALID_RANGE" },
+    { 0x12, "MALFORMED_TRACK" },
+    { 0x19, "DUPLICATE_SUBSCRIPTION" },
+    { 0x20, "UNINTERESTED" },
+    { 0x30, "PREFIX_OVERLAP" },
+    { 0x31, "NAMESPACE_TOO_LARGE" },
+    { 0x32, "INVALID_JOINING_REQUEST_ID" },
     { 0, NULL }
 };
 
@@ -453,6 +543,34 @@ static const val64_string moqt_draft18_publish_done_vals[] = {
     { 0, NULL }
 };
 
+/* Draft 18 swapped EXPIRED and TOO_FAR_BEHIND. */
+static const val64_string moqt_draft16_publish_done_vals[] = {
+    { 0x00, "INTERNAL_ERROR" },
+    { 0x01, "UNAUTHORIZED" },
+    { 0x02, "TRACK_ENDED" },
+    { 0x03, "SUBSCRIPTION_ENDED" },
+    { 0x04, "GOING_AWAY" },
+    { 0x05, "EXPIRED" },
+    { 0x06, "TOO_FAR_BEHIND" },
+    { 0x08, "UPDATE_FAILED" },
+    { 0x12, "MALFORMED_TRACK" },
+    { 0, NULL }
+};
+
+static const val64_string moqt_draft17_publish_done_vals[] = {
+    { 0x00, "INTERNAL_ERROR" },
+    { 0x01, "UNAUTHORIZED" },
+    { 0x02, "TRACK_ENDED" },
+    { 0x03, "SUBSCRIPTION_ENDED" },
+    { 0x04, "GOING_AWAY" },
+    { 0x05, "EXPIRED" },
+    { 0x06, "TOO_FAR_BEHIND" },
+    { 0x08, "UPDATE_FAILED" },
+    { 0x09, "EXCESSIVE_LOAD" },
+    { 0x12, "MALFORMED_TRACK" },
+    { 0, NULL }
+};
+
 static const val64_string moqt_draft22_publish_done_vals[] = {
     { 0x00, "INTERNAL_ERROR" },
     { 0x01, "UNAUTHORIZED" },
@@ -524,6 +642,23 @@ static const val64_string moqt_object_status_vals[] = {
     { 0x00, "Normal" },
     { 0x03, "End of Group" },
     { 0x04, "End of Track" },
+    { 0, NULL }
+};
+
+/* Drafts 16 and 17, before End of Track moved onto End of Subgroup's 0x04. */
+static const val64_string moqt_draft16_object_status_vals[] = {
+    { 0x00, "Normal" },
+    { 0x01, "Does Not Exist" },
+    { 0x03, "End of Group" },
+    { 0x04, "End of Subgroup" },
+    { 0x05, "End of Track" },
+    { 0, NULL }
+};
+
+static const val64_string moqt_subscribe_options_vals[] = {
+    { 0x00, "PUBLISH" },
+    { 0x01, "NAMESPACE" },
+    { 0x02, "Both" },
     { 0, NULL }
 };
 
@@ -717,6 +852,8 @@ struct moqt_draft {
     const val64_string *request_errors;
     const val64_string *publish_done_codes;
     const val64_string *fetch_end_of_range;
+    const val64_string *object_statuses;  /* NULL: moqt_object_status_vals */
+    bool parity_parameters;          /* unknown parameters follow type parity */
     const char *dissector_name;
     const char *datagram_dissector_name;
     const moqt_stream_layout_t *streams;
@@ -725,6 +862,8 @@ struct moqt_draft {
     void (*parse_datagram)(moqt_cursor_t *);
 };
 
+static const moqt_draft_t moqt_draft16;
+static const moqt_draft_t moqt_draft17;
 static const moqt_draft_t moqt_draft18;
 static const moqt_draft_t moqt_draft19;
 static const moqt_draft_t moqt_draft20;
@@ -734,6 +873,8 @@ static const moqt_draft_t moqt_draft23;
 
 /* Every supported draft, oldest first; the last one is the latest. */
 static const moqt_draft_t *const moqt_drafts[] = {
+    &moqt_draft16,
+    &moqt_draft17,
     &moqt_draft18,
     &moqt_draft19,
     &moqt_draft20,
@@ -788,6 +929,51 @@ moqt_draft18_read_integer(tvbuff_t *tvb, int offset, int end,
     for (int i = 1; i < length; i++) {
         decoded = (decoded << 8) | tvb_get_uint8(tvb, offset + i);
     }
+    if (value) {
+        *value = decoded;
+    }
+    if (encoded_length) {
+        *encoded_length = length;
+    }
+    return true;
+}
+
+/* Draft 17 section 1.4.1: the vi64 has no 7-byte form; 11111100 is invalid. */
+static bool
+moqt_draft17_read_integer(tvbuff_t *tvb, int offset, int end,
+                          uint64_t *value, int *encoded_length, int *needed)
+{
+    if (offset < end && tvb_bytes_exist(tvb, offset, 1) &&
+        tvb_get_uint8(tvb, offset) == 0xfc) {
+        *needed = 0;
+        return false;
+    }
+    return moqt_draft18_read_integer(tvb, offset, end, value, encoded_length,
+                                     needed);
+}
+
+/* Draft 16 carries integers as QUIC variable-length integers (RFC 9000). */
+static bool
+moqt_draft16_read_integer(tvbuff_t *tvb, int offset, int end,
+                          uint64_t *value, int *encoded_length, int *needed)
+{
+    int length;
+    uint64_t decoded;
+
+    if (offset >= end || !tvb_bytes_exist(tvb, offset, 1)) {
+        *needed = 1;
+        return false;
+    }
+    length = 1 << (tvb_get_uint8(tvb, offset) >> 6);
+    if (length > end - offset) {
+        *needed = length - (end - offset);
+        return false;
+    }
+    if (!tvb_bytes_exist(tvb, offset, length)) {
+        *needed = 0;
+        return false;
+    }
+    tvb_get_varint(tvb, offset, length, &decoded, ENC_VARINT_QUIC);
     if (value) {
         *value = decoded;
     }
@@ -1216,8 +1402,10 @@ moqt_dissect_subscription_filter(moqt_cursor_t *cursor)
         moqt_dissect_location(cursor, "Start Location");
     }
     if (type == MOQT_FILTER_ABSOLUTE_RANGE) {
-        moqt_cursor_varint(cursor, hf_moqt_end_group_delta, NULL,
-                           "subscription filter end group delta");
+        /* Draft 16 sends the End Group itself; later drafts a delta. */
+        moqt_cursor_varint(cursor, cursor->draft->version < 17
+                                       ? hf_moqt_end_group : hf_moqt_end_group_delta,
+                           NULL, "subscription filter end group");
     }
 }
 
@@ -1428,6 +1616,56 @@ static const moqt_parameter_descriptor_t moqt_draft18_parameters[] = {
       MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
     { MOQT_PARAM_TRACK_NAMESPACE_PREFIX, "TRACK_NAMESPACE_PREFIX",
       MOQT_PARAMETER_NAMESPACE, NULL, moqt_dissect_namespace_prefix },
+};
+
+/*
+ * Draft 16: every Message Parameter follows the Key-Value-Pair parity rule,
+ * so odd types are length prefixed even when they hold a structure. Types not
+ * listed here are still dissected by parity (see moqt_dissect_parameters).
+ */
+static const moqt_parameter_descriptor_t moqt_draft16_parameters[] = {
+    { MOQT_PARAM_OBJECT_DELIVERY_TIMEOUT, "DELIVERY_TIMEOUT",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_AUTHORIZATION_TOKEN, "AUTHORIZATION_TOKEN",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_token },
+    { MOQT_PARAM_EXPIRES, "EXPIRES",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_LARGEST_OBJECT, "LARGEST_OBJECT",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_largest_object },
+    { MOQT_PARAM_FORWARD, "FORWARD",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_SUBSCRIBER_PRIORITY, "SUBSCRIBER_PRIORITY",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_SUBSCRIPTION_FILTER, "SUBSCRIPTION_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_subscription_filter },
+    { MOQT_PARAM_GROUP_ORDER, "GROUP_ORDER",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_NEW_GROUP_REQUEST, "NEW_GROUP_REQUEST",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+};
+
+/* Draft 17 gave each parameter its own encoding; 0x02 covers both timeouts. */
+static const moqt_parameter_descriptor_t moqt_draft17_parameters[] = {
+    { MOQT_PARAM_OBJECT_DELIVERY_TIMEOUT, "DELIVERY_TIMEOUT",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_AUTHORIZATION_TOKEN, "AUTHORIZATION_TOKEN",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_token },
+    { MOQT_PARAM_RENDEZVOUS_TIMEOUT, "RENDEZVOUS_TIMEOUT",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_EXPIRES, "EXPIRES",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_LARGEST_OBJECT, "LARGEST_OBJECT",
+      MOQT_PARAMETER_LOCATION, NULL, moqt_dissect_largest_object },
+    { MOQT_PARAM_FORWARD, "FORWARD",
+      MOQT_PARAMETER_UINT8, &hf_moqt_parameter_uint8, NULL },
+    { MOQT_PARAM_SUBSCRIBER_PRIORITY, "SUBSCRIBER_PRIORITY",
+      MOQT_PARAMETER_UINT8, &hf_moqt_parameter_uint8, NULL },
+    { MOQT_PARAM_SUBSCRIPTION_FILTER, "SUBSCRIPTION_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_subscription_filter },
+    { MOQT_PARAM_GROUP_ORDER, "GROUP_ORDER",
+      MOQT_PARAMETER_UINT8, &hf_moqt_parameter_uint8, NULL },
+    { MOQT_PARAM_NEW_GROUP_REQUEST, "NEW_GROUP_REQUEST",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
 };
 
 /* Draft 19 section 10.2: draft 18 plus the Range Filters (#1765). */
@@ -1643,6 +1881,16 @@ moqt_dissect_parameters(moqt_cursor_t *cursor)
                 parameter.offset = parameter.end;
             } else if (descriptor) {
                 moqt_dissect_parameter_value(&parameter, descriptor);
+            } else if (cursor->draft->parity_parameters) {
+                /* Even types hold a varint, odd types a length-prefixed value. */
+                if ((previous_type & 1) == 0) {
+                    moqt_cursor_varint(&parameter, hf_moqt_parameter_varint,
+                                       NULL, "message parameter value");
+                } else {
+                    moqt_cursor_length_prefixed(&parameter, hf_moqt_parameter_length,
+                                                hf_moqt_parameter_value, NULL,
+                                                "message parameter value", ENC_NA);
+                }
             } else {
                 proto_tree_add_expert_format(
                     parameter.tree, cursor->pinfo, &ei_moqt_unknown_parameter,
@@ -1851,6 +2099,59 @@ moqt_dissect_kv_pairs(moqt_cursor_t *cursor, moqt_kv_kind_t kind,
     cursor->offset = container.offset;
     cursor->failed = container.failed;
     cursor->redirect_present = container.redirect_present;
+}
+
+/*
+ * Draft 16 counts its Setup Parameters and Extension Headers instead of
+ * bounding them by length. Each entry is a delta-encoded Key-Value-Pair.
+ */
+static void
+moqt_draft16_dissect_counted_kv_pairs(moqt_cursor_t *cursor, moqt_kv_kind_t kind,
+                                      int hf_count, const char *label)
+{
+    const moqt_kv_fields_t *fields =
+        kind == MOQT_KV_SETUP ? &moqt_setup_fields : &moqt_property_fields;
+    const val64_string *names =
+        kind == MOQT_KV_SETUP ? cursor->draft->setup_options
+                              : cursor->draft->properties;
+    proto_item *container_item;
+    moqt_cursor_t container;
+    uint64_t count, previous_type = 0;
+    int start;
+
+    if (!moqt_cursor_varint(cursor, hf_count, &count, "key-value pair count")) {
+        return;
+    }
+    start = cursor->offset;
+    container = *cursor;
+    container.tree = proto_tree_add_subtree_format(
+        cursor->tree, cursor->tvb, start, -1, *fields->ett_container,
+        &container_item, "%s (%" PRIu64 ")", label, count);
+    for (uint64_t i = 0; i < count && !container.failed; i++) {
+        proto_item *item, *type_item;
+        moqt_cursor_t pair = container;
+        int pair_start = pair.offset;
+
+        pair.tree = proto_tree_add_subtree_format(
+            container.tree, cursor->tvb, pair_start, -1, *fields->ett_entry,
+            &item, "%s %" PRIu64, fields->entry_name, i + 1);
+        if (moqt_cursor_type_delta(&pair, *fields->hf_delta, *fields->hf_type,
+                                   &previous_type, "key-value type delta",
+                                   &type_item)) {
+            const char *name = val64_to_str_const(previous_type, names, "Unknown");
+
+            proto_item_append_text(item, ": %s (0x%" PRIx64 ")", name,
+                                   previous_type);
+            proto_item_append_text(type_item, " (%s)", name);
+            moqt_dissect_kv_value(&pair, fields, kind, previous_type);
+        }
+        proto_item_set_len(item, pair.offset - pair_start);
+        container.offset = pair.offset;
+        container.failed = pair.failed;
+    }
+    proto_item_set_len(container_item, container.offset - start);
+    cursor->offset = container.offset;
+    cursor->failed = container.failed;
 }
 
 static bool
@@ -2165,6 +2466,273 @@ static const moqt_message_descriptor_t moqt_draft18_messages[] = {
     { MOQT_MSG_SETUP, "SETUP", moqt_draft18_decode_setup },
 };
 
+/* Draft 17: requests carry a Required Request ID Delta after the Request ID. */
+static void
+moqt_draft17_request_id(moqt_cursor_t *cursor)
+{
+    moqt_cursor_varint(cursor, hf_moqt_request_id, NULL, "request ID");
+    moqt_cursor_varint(cursor, hf_moqt_required_request_id_delta, NULL,
+                       "required request ID delta");
+}
+
+static void
+moqt_draft17_decode_request_update(moqt_cursor_t *cursor,
+                                   const moqt_stream_state_t *state _U_)
+{
+    moqt_draft17_request_id(cursor);
+    moqt_dissect_parameters(cursor);
+}
+
+static void
+moqt_draft17_decode_track_request(moqt_cursor_t *cursor,
+                                  const moqt_stream_state_t *state _U_)
+{
+    moqt_draft17_request_id(cursor);
+    moqt_dissect_full_track_name(cursor);
+    moqt_dissect_parameters(cursor);
+}
+
+static void
+moqt_draft17_decode_publish(moqt_cursor_t *cursor,
+                            const moqt_stream_state_t *state _U_)
+{
+    moqt_draft17_request_id(cursor);
+    moqt_dissect_full_track_name(cursor);
+    moqt_cursor_varint(cursor, hf_moqt_track_alias, NULL, "track alias");
+    moqt_dissect_parameters_and_properties(cursor);
+}
+
+static void
+moqt_draft17_decode_fetch(moqt_cursor_t *cursor,
+                          const moqt_stream_state_t *state _U_)
+{
+    uint64_t fetch_type;
+
+    moqt_draft17_request_id(cursor);
+    if (!moqt_cursor_varint(cursor, hf_moqt_fetch_type, &fetch_type,
+                            "fetch type")) {
+        return;
+    }
+    moqt_draft18_decode_fetch_range(cursor, fetch_type);
+    moqt_dissect_parameters(cursor);
+}
+
+static void
+moqt_draft17_decode_publish_namespace(moqt_cursor_t *cursor,
+                                      const moqt_stream_state_t *state _U_)
+{
+    moqt_draft17_request_id(cursor);
+    moqt_dissect_namespace(cursor, "Track Namespace");
+    moqt_dissect_parameters(cursor);
+}
+
+static void
+moqt_draft17_decode_subscribe_namespace(moqt_cursor_t *cursor,
+                                        const moqt_stream_state_t *state _U_)
+{
+    moqt_draft17_request_id(cursor);
+    moqt_dissect_namespace(cursor, "Track Namespace Prefix");
+    moqt_cursor_code(cursor, hf_moqt_subscribe_options,
+                     moqt_subscribe_options_vals, NULL, "subscribe options");
+    moqt_dissect_parameters(cursor);
+}
+
+/* REQUEST_OK and PUBLISH_OK: Parameters only, without Track Properties. */
+static void
+moqt_draft17_decode_parameters(moqt_cursor_t *cursor,
+                               const moqt_stream_state_t *state _U_)
+{
+    moqt_dissect_parameters(cursor);
+}
+
+/* Draft 17 REQUEST_ERROR has no Redirect. */
+static void
+moqt_draft17_decode_request_error(moqt_cursor_t *cursor,
+                                  const moqt_stream_state_t *state _U_)
+{
+    if (!moqt_cursor_code(cursor, hf_moqt_status_code,
+                          cursor->draft->request_errors, NULL,
+                          "request error code")) {
+        return;
+    }
+    moqt_cursor_varint(cursor, hf_moqt_retry_interval, NULL,
+                       "request retry interval");
+    moqt_dissect_reason_phrase(cursor);
+}
+
+static const moqt_message_descriptor_t moqt_draft17_messages[] = {
+    { MOQT_MSG_REQUEST_UPDATE, "REQUEST_UPDATE",
+      moqt_draft17_decode_request_update },
+    { MOQT_MSG_SUBSCRIBE, "SUBSCRIBE", moqt_draft17_decode_track_request },
+    { MOQT_MSG_SUBSCRIBE_OK, "SUBSCRIBE_OK", moqt_draft18_decode_subscribe_ok },
+    { MOQT_MSG_REQUEST_ERROR, "REQUEST_ERROR",
+      moqt_draft17_decode_request_error },
+    { MOQT_MSG_PUBLISH_NAMESPACE, "PUBLISH_NAMESPACE",
+      moqt_draft17_decode_publish_namespace },
+    { MOQT_MSG_REQUEST_OK, "REQUEST_OK", moqt_draft17_decode_parameters },
+    { MOQT_MSG_NAMESPACE, "NAMESPACE", moqt_draft18_decode_namespace_suffix },
+    { MOQT_MSG_PUBLISH_DONE, "PUBLISH_DONE", moqt_draft18_decode_publish_done },
+    { MOQT_MSG_TRACK_STATUS, "TRACK_STATUS", moqt_draft17_decode_track_request },
+    { MOQT_MSG_NAMESPACE_DONE, "NAMESPACE_DONE",
+      moqt_draft18_decode_namespace_suffix },
+    { MOQT_MSG_PUBLISH_BLOCKED, "PUBLISH_BLOCKED",
+      moqt_draft18_decode_publish_blocked },
+    { MOQT_MSG_GOAWAY, "GOAWAY", moqt_draft22_decode_goaway },
+    { MOQT_MSG_SUBSCRIBE_NAMESPACE_D16, "SUBSCRIBE_NAMESPACE",
+      moqt_draft17_decode_subscribe_namespace },
+    { MOQT_MSG_FETCH, "FETCH", moqt_draft17_decode_fetch },
+    { MOQT_MSG_FETCH_OK, "FETCH_OK", moqt_draft18_decode_fetch_ok },
+    { MOQT_MSG_PUBLISH, "PUBLISH", moqt_draft17_decode_publish },
+    { MOQT_MSG_PUBLISH_OK, "PUBLISH_OK", moqt_draft17_decode_parameters },
+    { MOQT_MSG_SETUP, "SETUP", moqt_draft18_decode_setup },
+};
+
+/* Draft 16: every response repeats the Request ID it answers. */
+static void
+moqt_draft16_request_id(moqt_cursor_t *cursor)
+{
+    moqt_cursor_varint(cursor, hf_moqt_request_id, NULL, "request ID");
+}
+
+static void
+moqt_draft16_decode_setup(moqt_cursor_t *cursor,
+                          const moqt_stream_state_t *state _U_)
+{
+    moqt_draft16_dissect_counted_kv_pairs(cursor, MOQT_KV_SETUP,
+                                          hf_moqt_setup_option_count,
+                                          "Setup Parameters");
+}
+
+static void
+moqt_draft16_decode_goaway(moqt_cursor_t *cursor,
+                           const moqt_stream_state_t *state _U_)
+{
+    moqt_cursor_length_prefixed(cursor, hf_moqt_uri_length, hf_moqt_uri,
+                                NULL, "new session URI", ENC_UTF_8 | ENC_NA);
+}
+
+static void
+moqt_draft16_decode_max_request_id(moqt_cursor_t *cursor,
+                                   const moqt_stream_state_t *state _U_)
+{
+    moqt_cursor_varint(cursor, hf_moqt_max_request_id, NULL, "maximum request ID");
+}
+
+/* UNSUBSCRIBE, FETCH_CANCEL and PUBLISH_NAMESPACE_DONE. */
+static void
+moqt_draft16_decode_request_id(moqt_cursor_t *cursor,
+                               const moqt_stream_state_t *state _U_)
+{
+    moqt_draft16_request_id(cursor);
+}
+
+/* REQUEST_OK and PUBLISH_OK. */
+static void
+moqt_draft16_decode_request_parameters(moqt_cursor_t *cursor,
+                                       const moqt_stream_state_t *state _U_)
+{
+    moqt_draft16_request_id(cursor);
+    moqt_dissect_parameters(cursor);
+}
+
+static void
+moqt_draft16_decode_request_error(moqt_cursor_t *cursor,
+                                  const moqt_stream_state_t *state)
+{
+    moqt_draft16_request_id(cursor);
+    moqt_draft17_decode_request_error(cursor, state);
+}
+
+static void
+moqt_draft16_decode_subscribe_ok(moqt_cursor_t *cursor,
+                                 const moqt_stream_state_t *state)
+{
+    moqt_draft16_request_id(cursor);
+    moqt_draft18_decode_subscribe_ok(cursor, state);
+}
+
+static void
+moqt_draft16_decode_request_update(moqt_cursor_t *cursor,
+                                   const moqt_stream_state_t *state _U_)
+{
+    moqt_draft16_request_id(cursor);
+    moqt_cursor_varint(cursor, hf_moqt_existing_request_id, NULL,
+                       "existing request ID");
+    moqt_dissect_parameters(cursor);
+}
+
+static void
+moqt_draft16_decode_publish_done(moqt_cursor_t *cursor,
+                                 const moqt_stream_state_t *state)
+{
+    moqt_draft16_request_id(cursor);
+    moqt_draft18_decode_publish_done(cursor, state);
+}
+
+static void
+moqt_draft16_decode_fetch_ok(moqt_cursor_t *cursor,
+                             const moqt_stream_state_t *state)
+{
+    moqt_draft16_request_id(cursor);
+    moqt_draft18_decode_fetch_ok(cursor, state);
+}
+
+static void
+moqt_draft16_decode_publish_namespace_cancel(moqt_cursor_t *cursor,
+                                             const moqt_stream_state_t *state _U_)
+{
+    moqt_draft16_request_id(cursor);
+    moqt_cursor_code(cursor, hf_moqt_status_code, cursor->draft->request_errors,
+                     NULL, "publish namespace cancel error code");
+    moqt_dissect_reason_phrase(cursor);
+}
+
+static void
+moqt_draft16_decode_subscribe_namespace(moqt_cursor_t *cursor,
+                                        const moqt_stream_state_t *state _U_)
+{
+    moqt_draft16_request_id(cursor);
+    moqt_dissect_namespace(cursor, "Track Namespace Prefix");
+    moqt_cursor_code(cursor, hf_moqt_subscribe_options,
+                     moqt_subscribe_options_vals, NULL, "subscribe options");
+    moqt_dissect_parameters(cursor);
+}
+
+static const moqt_message_descriptor_t moqt_draft16_messages[] = {
+    { MOQT_MSG_REQUEST_UPDATE, "REQUEST_UPDATE",
+      moqt_draft16_decode_request_update },
+    { MOQT_MSG_SUBSCRIBE, "SUBSCRIBE", moqt_draft18_decode_track_request },
+    { MOQT_MSG_SUBSCRIBE_OK, "SUBSCRIBE_OK", moqt_draft16_decode_subscribe_ok },
+    { MOQT_MSG_REQUEST_ERROR, "REQUEST_ERROR",
+      moqt_draft16_decode_request_error },
+    { MOQT_MSG_PUBLISH_NAMESPACE, "PUBLISH_NAMESPACE",
+      moqt_draft18_decode_publish_namespace },
+    { MOQT_MSG_REQUEST_OK, "REQUEST_OK", moqt_draft16_decode_request_parameters },
+    { MOQT_MSG_NAMESPACE, "NAMESPACE", moqt_draft18_decode_namespace_suffix },
+    { MOQT_MSG_PUBLISH_NAMESPACE_DONE, "PUBLISH_NAMESPACE_DONE",
+      moqt_draft16_decode_request_id },
+    { MOQT_MSG_UNSUBSCRIBE, "UNSUBSCRIBE", moqt_draft16_decode_request_id },
+    { MOQT_MSG_PUBLISH_DONE, "PUBLISH_DONE", moqt_draft16_decode_publish_done },
+    { MOQT_MSG_PUBLISH_NAMESPACE_CANCEL, "PUBLISH_NAMESPACE_CANCEL",
+      moqt_draft16_decode_publish_namespace_cancel },
+    { MOQT_MSG_TRACK_STATUS, "TRACK_STATUS", moqt_draft18_decode_track_request },
+    { MOQT_MSG_NAMESPACE_DONE, "NAMESPACE_DONE",
+      moqt_draft18_decode_namespace_suffix },
+    { MOQT_MSG_GOAWAY, "GOAWAY", moqt_draft16_decode_goaway },
+    { MOQT_MSG_SUBSCRIBE_NAMESPACE_D16, "SUBSCRIBE_NAMESPACE",
+      moqt_draft16_decode_subscribe_namespace },
+    { MOQT_MSG_MAX_REQUEST_ID, "MAX_REQUEST_ID", moqt_draft16_decode_max_request_id },
+    { MOQT_MSG_FETCH, "FETCH", moqt_draft18_decode_fetch },
+    { MOQT_MSG_FETCH_CANCEL, "FETCH_CANCEL", moqt_draft16_decode_request_id },
+    { MOQT_MSG_FETCH_OK, "FETCH_OK", moqt_draft16_decode_fetch_ok },
+    { MOQT_MSG_REQUESTS_BLOCKED, "REQUESTS_BLOCKED",
+      moqt_draft16_decode_max_request_id },
+    { MOQT_MSG_PUBLISH, "PUBLISH", moqt_draft18_decode_publish },
+    { MOQT_MSG_PUBLISH_OK, "PUBLISH_OK", moqt_draft16_decode_request_parameters },
+    { MOQT_MSG_CLIENT_SETUP, "CLIENT_SETUP", moqt_draft16_decode_setup },
+    { MOQT_MSG_SERVER_SETUP, "SERVER_SETUP", moqt_draft16_decode_setup },
+};
+
 /*
  * Draft 19: PUBLISH_OK is reserved (PUBLISH is answered with REQUEST_OK),
  * GOAWAY lost its Request ID and 0x0f is PUBLISH_SKIPPED; FETCH keeps the
@@ -2390,6 +2958,33 @@ finished:
     moqt_cursor_finish_nested(cursor, &header);
 }
 
+static const val64_string *
+moqt_draft_object_statuses(const moqt_draft_t *draft)
+{
+    return draft->object_statuses ? draft->object_statuses : moqt_object_status_vals;
+}
+
+/* Object Status values were renumbered between drafts, so name them here. */
+static bool
+moqt_cursor_object_status(moqt_cursor_t *cursor, uint64_t *status,
+                          const char *description)
+{
+    int start = cursor->offset;
+
+    if (!moqt_cursor_varint(cursor, -1, status, description)) {
+        return false;
+    }
+    if (cursor->phase == MOQT_DISSECT) {
+        proto_tree_add_uint64_format_value(
+            cursor->tree, hf_moqt_object_status, cursor->tvb, start,
+            cursor->offset - start, *status, "%s (0x%" PRIx64 ")",
+            val64_to_str_const(*status, moqt_draft_object_statuses(cursor->draft),
+                               "Unknown"),
+            *status);
+    }
+    return true;
+}
+
 static void
 moqt_validate_object_status(moqt_cursor_t *cursor, uint64_t status,
                             int offset, int length, uint64_t properties_length)
@@ -2397,9 +2992,7 @@ moqt_validate_object_status(moqt_cursor_t *cursor, uint64_t status,
     if (cursor->failed || cursor->phase == MOQT_MEASURE) {
         return;
     }
-    if (status != MOQT_OBJECT_NORMAL &&
-        status != MOQT_OBJECT_END_OF_GROUP &&
-        status != MOQT_OBJECT_END_OF_TRACK) {
+    if (!try_val64_to_str(status, moqt_draft_object_statuses(cursor->draft))) {
         proto_tree_add_expert_format(
             cursor->tree, cursor->pinfo, &ei_moqt_invalid_type, cursor->tvb,
             offset, length, "Invalid draft-%u object status 0x%" PRIx64,
@@ -2485,7 +3078,7 @@ moqt_draft18_parse_subgroup_object(moqt_cursor_t *cursor,
     }
     if (payload_length == 0) {
         status_offset = object.offset;
-        moqt_cursor_varint(&object, hf_moqt_object_status, &status,
+        moqt_cursor_object_status(&object, &status,
                            "object status");
         moqt_validate_object_status(&object, status, status_offset,
                                      object.offset - status_offset,
@@ -2511,8 +3104,120 @@ moqt_draft18_parse_subgroup_object(moqt_cursor_t *cursor,
         if (payload_length == 0) {
             proto_item_append_text(
                 item, ", Status: %s",
-                val64_to_str_const(status, moqt_object_status_vals, "Unknown"));
+                val64_to_str_const(status, moqt_draft_object_statuses(cursor->draft),
+                                   "Unknown"));
         }
+    }
+
+finished:
+    proto_item_set_len(item, object.offset - start);
+    moqt_cursor_finish_nested(cursor, &object);
+}
+
+/*
+ * Draft 16 subgroup header: Type (0x01), Track Alias, Group ID, Subgroup ID,
+ * Publisher Priority (8), End of Group (8).
+ */
+static void
+moqt_draft16_parse_subgroup_header(moqt_cursor_t *cursor,
+                                   moqt_stream_state_t *state)
+{
+    proto_item *item;
+    moqt_cursor_t header = *cursor;
+    moqt_stream_header_t decoded = { .priority_present = true };
+    uint64_t subgroup_id = 0;
+    int start = cursor->offset;
+
+    header.tree = proto_tree_add_subtree(
+        cursor->tree, cursor->tvb, start, -1,
+        ett_moqt_stream_header, &item, "SUBGROUP_HEADER");
+    moqt_cursor_varint(&header, hf_moqt_stream_type, &decoded.type,
+                       "subgroup stream type");
+    moqt_cursor_varint(&header, hf_moqt_track_alias, &decoded.track_alias,
+                       "track alias");
+    moqt_cursor_varint(&header, hf_moqt_group_id, &decoded.group_id, "group ID");
+    moqt_cursor_varint(&header, hf_moqt_subgroup_id, &subgroup_id, "subgroup ID");
+    moqt_cursor_uint8(&header, hf_moqt_publisher_priority,
+                      &decoded.publisher_priority, "publisher priority");
+    moqt_cursor_uint8(&header, hf_moqt_header_end_of_group, NULL, "end of group");
+
+    if (!header.failed && cursor->phase == MOQT_DISSECT) {
+        decoded.present = true;
+        decoded.subgroup_id_mode = MOQT_SUBGROUP_ID_EXPLICIT;
+        state->header = decoded;
+        state->subgroup = (moqt_subgroup_state_t){
+            .subgroup_id_known = true,
+            .subgroup_id = subgroup_id,
+        };
+        proto_item_append_text(item, ": Track Alias %" PRIu64
+                               ", Group %" PRIu64,
+                               decoded.track_alias, decoded.group_id);
+        col_append_sep_fstr(cursor->pinfo->cinfo, COL_INFO, ", ",
+                            "Subgroup Header (Track Alias %" PRIu64
+                            ", Group %" PRIu64 ")",
+                            decoded.track_alias, decoded.group_id);
+    }
+    proto_item_set_len(item, header.offset - start);
+    moqt_cursor_finish_nested(cursor, &header);
+}
+
+/*
+ * Draft 16 subgroup object: Object ID, Extension Headers (counted), Payload
+ * Length, then the Payload. An empty Object is followed by its Object Status
+ * only when that status is not Normal; libloc recognises it by a non-zero,
+ * registered status value.
+ */
+static void
+moqt_draft16_parse_subgroup_object(moqt_cursor_t *cursor,
+                                   moqt_stream_state_t *state _U_)
+{
+    proto_item *item;
+    moqt_cursor_t object = *cursor;
+    uint64_t object_id;
+    uint64_t payload_length;
+    uint64_t status = MOQT_OBJECT_NORMAL;
+    int start = cursor->offset;
+
+    object.tree = proto_tree_add_subtree(
+        cursor->tree, cursor->tvb, start, -1, ett_moqt_object,
+        &item, "Subgroup Object");
+    if (!moqt_cursor_varint(&object, hf_moqt_object_id, &object_id, "object ID")) {
+        goto finished;
+    }
+    moqt_draft16_dissect_counted_kv_pairs(&object, MOQT_KV_PROPERTY,
+                                          hf_moqt_extension_count,
+                                          "Extension Headers");
+    if (!moqt_cursor_varint(&object, hf_moqt_object_payload_length,
+                            &payload_length, "object payload length")) {
+        goto finished;
+    }
+    if (payload_length == 0) {
+        uint64_t next;
+
+        if (object.offset < object.end &&
+            object.draft->read_integer(object.tvb, object.offset, object.end,
+                                       &next, NULL, &object.needed) &&
+            next != MOQT_OBJECT_NORMAL &&
+            try_val64_to_str(next, moqt_draft_object_statuses(object.draft))) {
+            moqt_cursor_object_status(&object, &status, "object status");
+        }
+        object.needed = 0;
+    } else {
+        moqt_cursor_bytes(&object, hf_moqt_object_payload, payload_length,
+                          "object payload", ENC_NA);
+    }
+    if (!object.failed && cursor->phase == MOQT_DISSECT) {
+        proto_item_append_text(item, " %" PRIu64 ": Payload %" PRIu64 " byte%s",
+                               object_id, payload_length,
+                               payload_length == 1 ? "" : "s");
+        if (payload_length == 0) {
+            proto_item_append_text(
+                item, ", Status: %s",
+                val64_to_str_const(status, moqt_draft_object_statuses(cursor->draft),
+                                   "Unknown"));
+        }
+        col_append_sep_fstr(cursor->pinfo->cinfo, COL_INFO, ", ",
+                            "Object %" PRIu64, object_id);
     }
 
 finished:
@@ -2577,8 +3282,12 @@ static void
 moqt_draft18_parse_fetch_fields(moqt_cursor_t *cursor, uint64_t flags,
                                 uint64_t *payload_length)
 {
+    /* Before draft 18 the Group and Object IDs are absolute. */
+    bool absolute = cursor->draft->version < 18;
+
     if ((flags & MOQT_FETCH_GROUP_ID_DELTA) != 0) {
-        moqt_cursor_varint(cursor, hf_moqt_group_id_delta, NULL, "group ID delta");
+        moqt_cursor_varint(cursor, absolute ? hf_moqt_group_id : hf_moqt_group_id_delta,
+                           NULL, "group ID");
     }
     if ((flags & MOQT_FETCH_DATAGRAM) == 0 &&
         (flags & MOQT_FETCH_SUBGROUP_ID_MODE) == MOQT_FETCH_SUBGROUP_ID_EXPLICIT) {
@@ -2591,8 +3300,8 @@ moqt_draft18_parse_fetch_fields(moqt_cursor_t *cursor, uint64_t flags,
         if (moqt_cursor_varint(cursor, -1, &delta, "object ID delta") &&
             cursor->phase == MOQT_DISSECT) {
             proto_item *item = proto_tree_add_uint64(
-                cursor->tree, hf_moqt_object_id_delta, cursor->tvb,
-                start, cursor->offset - start, delta);
+                cursor->tree, absolute ? hf_moqt_object_id : hf_moqt_object_id_delta,
+                cursor->tvb, start, cursor->offset - start, delta);
 
             if (cursor->draft->version >= 23 &&
                 (flags & MOQT_FETCH_GROUP_ID_DELTA) == 0) {
@@ -2605,7 +3314,13 @@ moqt_draft18_parse_fetch_fields(moqt_cursor_t *cursor, uint64_t flags,
                           "publisher priority");
     }
     if ((flags & MOQT_FETCH_PROPERTIES) != 0) {
-        moqt_dissect_object_properties(cursor, NULL);
+        if (cursor->draft->version < 17) {
+            moqt_draft16_dissect_counted_kv_pairs(cursor, MOQT_KV_PROPERTY,
+                                                  hf_moqt_extension_count,
+                                                  "Extension Headers");
+        } else {
+            moqt_dissect_object_properties(cursor, NULL);
+        }
     }
     moqt_cursor_length_prefixed(cursor, hf_moqt_object_payload_length,
                                 hf_moqt_object_payload, payload_length,
@@ -2741,6 +3456,39 @@ moqt_draft18_classify_stream(uint64_t type)
     return MOQT_STREAM_UNKNOWN;
 }
 
+/* Draft 17: no PADDING stream and no FIRST_OBJECT bit. */
+static moqt_stream_kind_t
+moqt_draft17_classify_stream(uint64_t type)
+{
+    if (type == MOQT_STREAM_PADDING ||
+        (type > MOQT_DRAFT17_SUBGROUP_DEFINED_BITS &&
+         type <= MOQT_SUBGROUP_DEFINED_BITS)) {
+        return MOQT_STREAM_UNKNOWN;
+    }
+    return moqt_draft18_classify_stream(type);
+}
+
+/*
+ * Draft 16 has no control stream type: SETUP and every other control message
+ * use the first bidirectional stream. Only exported PDUs reach this with a
+ * message type, which identifies the client's or server's SETUP.
+ */
+static moqt_stream_kind_t
+moqt_draft16_classify_stream(uint64_t type)
+{
+    switch (type) {
+    case MOQT_MSG_CLIENT_SETUP:
+    case MOQT_MSG_SERVER_SETUP:
+        return MOQT_STREAM_CONTROL;
+    case MOQT_DRAFT16_STREAM_SUBGROUP:
+        return MOQT_STREAM_SUBGROUP;
+    case MOQT_DRAFT16_STREAM_FETCH:
+        return MOQT_STREAM_FETCH_DATA;
+    default:
+        return MOQT_STREAM_UNKNOWN;
+    }
+}
+
 static const moqt_stream_layout_t moqt_draft18_streams[MOQT_STREAM_KIND_COUNT] = {
     [MOQT_STREAM_CONTROL] = { NULL, moqt_draft18_parse_message },
     [MOQT_STREAM_REQUEST] = { NULL, moqt_draft18_parse_message },
@@ -2752,6 +3500,17 @@ static const moqt_stream_layout_t moqt_draft18_streams[MOQT_STREAM_KIND_COUNT] =
     },
     [MOQT_STREAM_PADDING_DATA] = {
         moqt_draft18_parse_padding_header, moqt_draft18_parse_padding
+    },
+};
+
+static const moqt_stream_layout_t moqt_draft16_streams[MOQT_STREAM_KIND_COUNT] = {
+    [MOQT_STREAM_CONTROL] = { NULL, moqt_draft18_parse_message },
+    [MOQT_STREAM_REQUEST] = { NULL, moqt_draft18_parse_message },
+    [MOQT_STREAM_SUBGROUP] = {
+        moqt_draft16_parse_subgroup_header, moqt_draft16_parse_subgroup_object
+    },
+    [MOQT_STREAM_FETCH_DATA] = {
+        moqt_draft18_parse_fetch_header, moqt_draft18_parse_fetch_object
     },
 };
 
@@ -3085,7 +3844,7 @@ moqt_draft18_parse_datagram_object(moqt_cursor_t *cursor, uint64_t type)
     }
     if ((type & MOQT_DATAGRAM_STATUS) != 0) {
         status_offset = cursor->offset;
-        moqt_cursor_varint(cursor, hf_moqt_object_status, &status, "object status");
+        moqt_cursor_object_status(cursor, &status, "object status");
         moqt_validate_object_status(cursor, status, status_offset,
                                      cursor->offset - status_offset,
                                      properties_length);
@@ -3099,7 +3858,8 @@ moqt_draft18_parse_datagram_object(moqt_cursor_t *cursor, uint64_t type)
                         ", Object %" PRIu64 ", ", track_alias, group_id, object_id);
     if ((type & MOQT_DATAGRAM_STATUS) != 0) {
         col_append_fstr(cursor->pinfo->cinfo, COL_INFO, "%s)",
-                        val64_to_str_const(status, moqt_object_status_vals,
+                        val64_to_str_const(status,
+                                           moqt_draft_object_statuses(cursor->draft),
                                            "Unknown status"));
     } else {
         col_append_fstr(cursor->pinfo->cinfo, COL_INFO, "%d bytes)",
@@ -3138,6 +3898,95 @@ moqt_draft18_parse_datagram(moqt_cursor_t *cursor)
     moqt_add_datagram_type_flags(cursor, type_length, type);
     moqt_draft18_parse_datagram_object(cursor, type);
 }
+
+/*
+ * Draft 16 OBJECT_DATAGRAM has no type: Track Alias, Group ID, Object ID,
+ * Publisher Priority (8), Extension Headers (counted), Object Status, and for
+ * a Normal Object the rest of the datagram as its payload.
+ */
+static void
+moqt_draft16_parse_datagram(moqt_cursor_t *cursor)
+{
+    uint64_t track_alias = 0, group_id = 0, object_id = 0;
+    uint64_t status = MOQT_OBJECT_NORMAL;
+    int status_offset;
+
+    moqt_cursor_varint(cursor, hf_moqt_track_alias, &track_alias, "track alias");
+    moqt_cursor_varint(cursor, hf_moqt_group_id, &group_id, "group ID");
+    moqt_cursor_varint(cursor, hf_moqt_object_id, &object_id, "object ID");
+    moqt_cursor_uint8(cursor, hf_moqt_publisher_priority, NULL,
+                      "publisher priority");
+    moqt_draft16_dissect_counted_kv_pairs(cursor, MOQT_KV_PROPERTY,
+                                          hf_moqt_extension_count,
+                                          "Extension Headers");
+    status_offset = cursor->offset;
+    if (moqt_cursor_object_status(cursor, &status, "object status")) {
+        moqt_validate_object_status(cursor, status, status_offset,
+                                    cursor->offset - status_offset, 0);
+    }
+    if (cursor->failed) {
+        col_append_sep_str(cursor->pinfo->cinfo, COL_INFO, ", ", "Object Datagram");
+        return;
+    }
+    col_append_sep_fstr(cursor->pinfo->cinfo, COL_INFO, ", ",
+                        "Object Datagram (Track Alias %" PRIu64 ", Group %" PRIu64
+                        ", Object %" PRIu64 ", ", track_alias, group_id, object_id);
+    if (status != MOQT_OBJECT_NORMAL) {
+        col_append_fstr(cursor->pinfo->cinfo, COL_INFO, "%s)",
+                        val64_to_str_const(status,
+                                           moqt_draft_object_statuses(cursor->draft),
+                                           "Unknown status"));
+        moqt_cursor_remainder(cursor, hf_moqt_unparsed);
+    } else {
+        col_append_fstr(cursor->pinfo->cinfo, COL_INFO, "%d bytes)",
+                        cursor->end - cursor->offset);
+        moqt_cursor_remainder(cursor, hf_moqt_object_payload);
+    }
+}
+
+static const moqt_draft_t moqt_draft16 = {
+    .version = 16,
+    .alpn = MOQT_ALPN_DRAFT_16,
+    .messages = moqt_draft16_messages,
+    .message_count = array_length(moqt_draft16_messages),
+    .parameters = moqt_draft16_parameters,
+    .parameter_count = array_length(moqt_draft16_parameters),
+    .setup_options = moqt_draft16_setup_option_type_vals,
+    .properties = moqt_property_type_vals,
+    .request_errors = moqt_draft16_request_error_vals,
+    .publish_done_codes = moqt_draft16_publish_done_vals,
+    .fetch_end_of_range = moqt_draft18_fetch_end_vals,
+    .object_statuses = moqt_draft16_object_status_vals,
+    .parity_parameters = true,
+    .dissector_name = MOQT_ALPN_DRAFT_16,
+    .datagram_dissector_name = MOQT_ALPN_DRAFT_16 ".datagram",
+    .streams = moqt_draft16_streams,
+    .classify_stream = moqt_draft16_classify_stream,
+    .read_integer = moqt_draft16_read_integer,
+    .parse_datagram = moqt_draft16_parse_datagram,
+};
+
+/* Draft 17 keeps the draft-18 stream and datagram layouts, less PADDING. */
+static const moqt_draft_t moqt_draft17 = {
+    .version = 17,
+    .alpn = MOQT_ALPN_DRAFT_17,
+    .messages = moqt_draft17_messages,
+    .message_count = array_length(moqt_draft17_messages),
+    .parameters = moqt_draft17_parameters,
+    .parameter_count = array_length(moqt_draft17_parameters),
+    .setup_options = moqt_setup_option_type_vals,
+    .properties = moqt_property_type_vals,
+    .request_errors = moqt_draft17_request_error_vals,
+    .publish_done_codes = moqt_draft17_publish_done_vals,
+    .fetch_end_of_range = moqt_draft18_fetch_end_vals,
+    .object_statuses = moqt_draft16_object_status_vals,
+    .dissector_name = MOQT_ALPN_DRAFT_17,
+    .datagram_dissector_name = MOQT_ALPN_DRAFT_17 ".datagram",
+    .streams = moqt_draft18_streams,
+    .classify_stream = moqt_draft17_classify_stream,
+    .read_integer = moqt_draft17_read_integer,
+    .parse_datagram = moqt_draft18_parse_datagram,
+};
 
 static const moqt_draft_t moqt_draft18 = {
     .version = 18,
@@ -3320,6 +4169,47 @@ proto_register_moqt(void)
             FT_UINT64, BASE_DEC, NULL, 0x0,
             NULL, HFILL }
         },
+        { &hf_moqt_required_request_id_delta,
+          { "Required Request ID Delta", "moqt.required_request_id_delta",
+            FT_UINT64, BASE_DEC, NULL, 0x0,
+            "Draft 17: requests before this Request ID minus the delta must complete first",
+            HFILL }
+        },
+        { &hf_moqt_existing_request_id,
+          { "Existing Request ID", "moqt.existing_request_id",
+            FT_UINT64, BASE_DEC, NULL, 0x0,
+            "Draft 16: the request a REQUEST_UPDATE changes", HFILL }
+        },
+        { &hf_moqt_max_request_id,
+          { "Maximum Request ID", "moqt.max_request_id",
+            FT_UINT64, BASE_DEC, NULL, 0x0,
+            "Draft 16 Request ID flow control", HFILL }
+        },
+        { &hf_moqt_subscribe_options,
+          { "Subscribe Options", "moqt.subscribe_options",
+            FT_UINT64, BASE_HEX, NULL, 0x0,
+            "Drafts 16 and 17 SUBSCRIBE_NAMESPACE options", HFILL }
+        },
+        { &hf_moqt_setup_option_count,
+          { "Number of Setup Parameters", "moqt.setup.option.count",
+            FT_UINT64, BASE_DEC, NULL, 0x0,
+            NULL, HFILL }
+        },
+        { &hf_moqt_extension_count,
+          { "Number of Extension Headers", "moqt.extensions.count",
+            FT_UINT64, BASE_DEC, NULL, 0x0,
+            "Draft 16 Object Extension Headers", HFILL }
+        },
+        { &hf_moqt_header_end_of_group,
+          { "End of Group", "moqt.header.end_of_group",
+            FT_UINT8, BASE_DEC, NULL, 0x0,
+            "Draft 16 subgroup header End of Group flag", HFILL }
+        },
+        { &hf_moqt_end_group,
+          { "End Group", "moqt.filter.end_group",
+            FT_UINT64, BASE_DEC, NULL, 0x0,
+            "Draft 16 absolute SUBSCRIPTION_FILTER end", HFILL }
+        },
         { &hf_moqt_track_alias,
           { "Track Alias", "moqt.track_alias",
             FT_UINT64, BASE_DEC, NULL, 0x0,
@@ -3492,9 +4382,8 @@ proto_register_moqt(void)
         },
         { &hf_moqt_object_status,
           { "Object Status", "moqt.object.status",
-            FT_UINT64, BASE_HEX | BASE_VAL64_STRING,
-            VALS64(moqt_object_status_vals), 0x0,
-            NULL, HFILL }
+            FT_UINT64, BASE_HEX, NULL, 0x0,
+            "Object Status; the names depend on the draft", HFILL }
         },
         { &hf_moqt_object_payload_length,
           { "Object Payload Length", "moqt.object.payload_length",
