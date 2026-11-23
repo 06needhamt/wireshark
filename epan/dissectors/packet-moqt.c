@@ -4713,14 +4713,23 @@ proto_register_moqt(void)
 void
 proto_reg_handoff_moqt(void)
 {
+    /*
+     * Over WebTransport the same tokens are negotiated with WT-Protocol, and
+     * HTTP/3 passes stream data with the same stream metadata.
+     */
     for (unsigned i = 0; i < array_length(moqt_drafts); i++) {
         dissector_add_string("quic.proto", moqt_drafts[i]->alpn, moqt_handles[i]);
         dissector_add_string("quic.proto.datagram", moqt_drafts[i]->alpn,
+                             moqt_datagram_handles[i]);
+        dissector_add_string("http3.wt.protocol", moqt_drafts[i]->alpn, moqt_handles[i]);
+        dissector_add_string("http3.wt.protocol.datagram", moqt_drafts[i]->alpn,
                              moqt_datagram_handles[i]);
     }
     /* The final version's ALPN; until then, the latest draft. */
     dissector_add_string("quic.proto", "moqt", moqt_handle);
     dissector_add_string("quic.proto.datagram", "moqt", moqt_datagram_handle);
+    dissector_add_string("http3.wt.protocol", "moqt", moqt_handle);
+    dissector_add_string("http3.wt.protocol.datagram", "moqt", moqt_datagram_handle);
 }
 
 /*

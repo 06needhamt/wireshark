@@ -17,8 +17,9 @@
  *
  * Over bare QUIC the protocol is negotiated with the ALPN token "moq-lite-xx",
  * which is how this dissector is reached. A session running over WebTransport
- * keeps the "h3" ALPN and advertises moq-lite in the WT-Protocol header, which
- * Wireshark does not currently use to select a subprotocol dissector.
+ * keeps the "h3" ALPN and negotiates the same token in the WT-Protocol header;
+ * HTTP/3 then hands the WebTransport streams and datagrams to the handle
+ * registered for that token, which carries the version.
  *
  * Draft 02 and earlier negotiated the version with a SESSION_CLIENT and
  * SESSION_SERVER message on a Session stream instead of relying on the ALPN
@@ -436,7 +437,8 @@ moql_session_lookup_or_create(packet_info *pinfo)
         session->version = MOQL_VERSION_LATEST;
         const char *alpn = tls_get_alpn(tls_get_current_session(pinfo));
         if (alpn != NULL && strlen(alpn) == 11 &&
-            strncmp(alpn, "moq-lite-0", 10) == 0 && alpn[10] >= '0' && alpn[10] <= '5') {
+            strncmp(alpn, "moq-lite-0", 10) == 0 && alpn[10] >= '0' &&
+            alpn[10] <= '0' + MOQL_VERSION_LATEST) {
             session->version = (unsigned)(alpn[10] - '0');
         }
         conversation_add_proto_data(conversation, proto_moq_lite, session);
@@ -1812,6 +1814,38 @@ dissect_moql(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
     return tvb_captured_length(tvb);
 }
 
+/*
+ * Over WebTransport the QUIC ALPN is "h3", so the version comes from the
+ * WT-Protocol token whose handle was called (cb_data is the draft number).
+ */
+static void
+moql_set_wt_version(packet_info *pinfo, void *cb_data)
+{
+    moql_session_t *session = moql_session_lookup_or_create(pinfo);
+
+    if (!session->version_known) {
+        session->version = GPOINTER_TO_UINT(cb_data);
+        session->version_known = true;
+    }
+}
+
+static int dissect_moql_datagram(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data);
+
+static int
+dissect_moql_wt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data, void *cb_data)
+{
+    moql_set_wt_version(pinfo, cb_data);
+    return dissect_moql(tvb, pinfo, tree, data);
+}
+
+static int
+dissect_moql_wt_datagram(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data,
+                         void *cb_data)
+{
+    moql_set_wt_version(pinfo, cb_data);
+    return dissect_moql_datagram(tvb, pinfo, tree, data);
+}
+
 static int
 dissect_moql_datagram(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
@@ -2287,6 +2321,14 @@ proto_reg_handoff_moq_lite(void)
 
         dissector_add_string("quic.proto", alpn, moql_handle);
         dissector_add_string("quic.proto.datagram", alpn, moql_datagram_handle);
+        /* The same token as a WebTransport application protocol. */
+        dissector_add_string("http3.wt.protocol", alpn,
+                             create_dissector_handle_with_data(dissect_moql_wt, proto_moq_lite,
+                                                               GUINT_TO_POINTER(version)));
+        dissector_add_string("http3.wt.protocol.datagram", alpn,
+                             create_dissector_handle_with_data(dissect_moql_wt_datagram,
+                                                               proto_moq_lite,
+                                                               GUINT_TO_POINTER(version)));
         g_free(alpn);
     }
 }

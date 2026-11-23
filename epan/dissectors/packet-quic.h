@@ -34,6 +34,14 @@ typedef struct _quic_stream_info {
     bool        from_server;
     bool        fin;            /**< True if the frame marks the end of the stream. */
     bool        fin_only;       /**< True for a FIN-only STREAM frame with no application data. */
+    /**
+     * Storage for quic_stream_add_proto_data() and quic_stream_get_proto_data(),
+     * indexed by from_server, used instead of the QUIC stream's own when not NULL.
+     * A protocol carried inside another stream protocol (for example, a
+     * WebTransport application protocol inside HTTP/3) sets this before calling
+     * its subdissector, so that both protocols can keep per-stream state.
+     */
+    void      **subdissector_slots;
 } quic_stream_info;
 
 /**

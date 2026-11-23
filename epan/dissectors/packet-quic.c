@@ -2871,12 +2871,19 @@ dissect_quic_crypto_payload(tvbuff_t *tvb, int offset, int length, packet_info *
 void
 quic_stream_add_proto_data(packet_info *pinfo, quic_stream_info *stream_info, void *proto_data)
 {
+    if (stream_info->subdissector_slots) {
+        stream_info->subdissector_slots[stream_info->from_server ? 1 : 0] = proto_data;
+        return;
+    }
     quic_stream_state *stream = quic_get_stream_state(pinfo, stream_info->quic_info, stream_info->from_server, stream_info->stream_id);
     stream->subdissector_private = proto_data;
 }
 
 void *quic_stream_get_proto_data(packet_info *pinfo, quic_stream_info *stream_info)
 {
+    if (stream_info->subdissector_slots) {
+        return stream_info->subdissector_slots[stream_info->from_server ? 1 : 0];
+    }
     quic_stream_state *stream = quic_get_stream_state(pinfo, stream_info->quic_info, stream_info->from_server, stream_info->stream_id);
     return stream->subdissector_private;
 }

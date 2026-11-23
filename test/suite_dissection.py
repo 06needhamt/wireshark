@@ -3343,6 +3343,95 @@ class TestDissectMoqLite:
 
 
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
+class TestDissectWebTransport:
+    '''
+    WebTransport over HTTP/3, generated with tools/generate-webtransport-capture.py.
+    Session 0 negotiates moqt-23 with WT-Protocol, session 8 offers only
+    moq-lite-06; both use WebTransport streams and datagrams, and session 0
+    ends with capsules.
+    '''
+    @staticmethod
+    def _fields(cmd_tshark, capture_file, test_env, pass_args, display_filter, *fields):
+        command = [cmd_tshark, *pass_args, '-r', capture_file('webtransport-moq.pcapng.gz'),
+                   '-Y', display_filter, '-T', 'fields']
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_webtransport_streams(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Streams are tied to their session and its application protocol.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'http3.webtransport.session_id', 'http3.webtransport.session_id',
+                            'http3.webtransport.protocol', 'http3.webtransport.signal',
+                            'http3.stream_uni_type')
+        assert rows == [
+            ['0', 'moqt-23', '', '0x0000000000000054'],             # control stream
+            ['0', 'moqt-23', '0x0000000000000041', ''],             # SUBSCRIBE, part 1
+            ['0', 'moqt-23', '', ''],                               # SUBSCRIBE, part 2
+            ['0', 'moqt-23', '', ''],                               # SUBSCRIBE_OK
+            ['0', 'moqt-23', '', '0x0000000000000054'],             # subgroup stream
+            ['0', 'moqt-23', '0x0000000000000041', ''],             # server bidi stream
+            ['8', 'moq-lite-06', '', '0x0000000000000054'],         # Setup stream
+            ['8', 'moq-lite-06', '0x0000000000000041', ''],         # Subscribe stream
+            ['8', 'moq-lite-06', '', ''],
+            ['8', 'moq-lite-06', '', '0x0000000000000054'],         # Group stream
+        ]
+
+    def test_webtransport_moqt(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''MOQT runs over WebTransport, including a reassembled message.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moqt',
+                            'moqt.draft', '_ws.col.info')
+        # The first part of the split SUBSCRIBE waits for the rest.
+        assert rows[1][1].startswith('WebTransport (session 0)')
+        assert 'SUBSCRIBE' not in rows[1][1]
+        del rows[1]
+        assert rows == [
+            ['23', 'WebTransport (session 0), SETUP'],
+            ['23', 'SUBSCRIBE'],
+            ['23', 'SUBSCRIBE_OK'],
+            ['23', 'WebTransport (session 0), Subgroup Header (Track Alias 1, Group 5), Object 0'],
+            ['23', 'DATAGRAM, Object Datagram (Track Alias 1, Group 5, Object 1, 15 bytes)'],
+            ['23', 'WebTransport (session 0), TRACK_STATUS'],
+        ]
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moqt.message.type == 3', 'moqt.track_name') == [['766964656f']]
+
+    def test_webtransport_moq_lite(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''moq-lite takes its version from WT-Protocol, not from the ALPN.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moql', '_ws.col.info')
+        assert [row[0] for row in rows] == [
+            'Setup stream, SETUP', 'Subscribe stream, SUBSCRIBE(id=0 room audio)',
+            'Subscribe stream, SUBSCRIBE_OK(group=4)', 'Group stream, GROUP(id=0 group=4), FRAME',
+            'Group datagram(id=0 group=5 ts=960 4 bytes)']
+        # Draft-06 fields: Frame Start/End in SUBSCRIBE and Frame Start in GROUP.
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moql.frame_start',
+                            'moql.frame_start', 'moql.frame_end') == [['0', '0'], ['0', '']]
+
+    def test_webtransport_capsules(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''WebTransport capsules on the CONNECT stream.'''
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args, 'capsule',
+                            'capsule.type', 'capsule.wt.max_data', 'capsule.wt.error_code',
+                            'capsule.wt.error_message') == [
+            ['0x00000000190b4d3d,0x00000000000078ae', '65536', '', ''],
+            ['0x0000000000002843', '', '7', 'bye']]
+
+    def test_webtransport_datagrams(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Datagrams go to the protocol of the session named by their stream ID.'''
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args, 'http3.datagram',
+                            'http3.datagram.request_stream_id', 'http3.webtransport.protocol',
+                            '_ws.col.protocol') == [
+            ['0', 'moqt-23', 'MOQT'], ['8', 'moq-lite-06', 'MoQ-Lite']]
+
+    def test_webtransport_expert(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Nothing in the capture is reported as a problem.'''
+        stdout = subprocess.check_output((cmd_tshark, *pass_args,
+                '-r', capture_file('webtransport-moq.pcapng.gz'), '-q', '-zexpert,warn',
+            ), encoding='utf-8', env=test_env)
+        assert not grep_output(stdout, 'Errors|Warnings')
+
+
+@pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
 class TestDissectMoqLite06:
     '''
     moq-lite-06 over QUIC, generated with tools/generate-moq-lite-06-capture.py.
@@ -132004,7 +132093,11 @@ class TestDissectHttp3Decrypt:
         push, QPACK encoder and decoder streams and an unknown stream type.'''
         rows = self.fields(cmd_tshark, capture_file, test_env, 'http3.frame_type', 'http3.frame_type')
         types = {int(t, 0) for r in rows for t in r[0].split(',')}
-        assert {0x0, 0x1, 0x3, 0x4, 0x5, 0x7, 0xd, 0xf0700, 0xf0701, 0x41} <= types
+        assert {0x0, 0x1, 0x3, 0x4, 0x5, 0x7, 0xd, 0xf0700, 0xf0701} <= types
+        # The WebTransport stream signal is not an HTTP/3 frame.
+        assert 0x41 not in types
+        assert self.fields(cmd_tshark, capture_file, test_env, 'http3.webtransport.signal == 0x41',
+                           'frame.number')
         rows = self.fields(cmd_tshark, capture_file, test_env, 'http3.stream_uni_type', 'http3.stream_uni_type')
         stypes = {int(t, 0) for r in rows for t in r[0].split(',')}
         assert {0, 1, 2, 3, 0x54} <= stypes
@@ -132114,10 +132207,11 @@ class TestDissectHttp3Decrypt:
 
     def test_http3_datagrams_and_webtransport(self, cmd_tshark, capture_file, test_env):
         '''H3 datagrams carry the quarter stream ID of the CONNECT stream; a
-        WebTransport bidirectional stream is signalled with frame type 0x41.'''
+        WebTransport bidirectional stream is opened with the signal 0x41.'''
         rows = self.fields(cmd_tshark, capture_file, test_env, 'http3.datagram', 'http3.datagram.quarter_stream_id')
         assert len(rows) == 2 and rows[0] == rows[1]
-        assert self.fields(cmd_tshark, capture_file, test_env, 'http3.frame_type == 0x41', 'frame.number')
+        assert self.fields(cmd_tshark, capture_file, test_env, 'http3.webtransport.signal == 0x41',
+                           'frame.number')
 
     def test_http3_follow_stream(self, cmd_tshark, capture_file, test_env, features):
         '''Follow HTTP/3 stream 0 of the first connection (headers and data).'''

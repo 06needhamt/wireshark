@@ -42,6 +42,7 @@
 
 #include <epan/dissectors/packet-http3.h>
 #include <epan/dissectors/packet-http.h> /* for getting status reason-phrase */
+#include <epan/dissectors/packet-http-capsule.h>
 #include <epan/dissectors/packet-media-type.h>
 #include <epan/dissectors/packet-quic.h>
 #include <epan/dissectors/packet-udp.h>
@@ -61,6 +62,14 @@ void proto_register_http3(void);
 
 static dissector_handle_t http3_handle;
 static dissector_handle_t http3_datagram_handle;
+static dissector_handle_t http3_capsule_handle;
+
+/*
+ * WebTransport application protocols (the negotiated WT-Protocol, e.g.
+ * "moqt-17"), for WebTransport streams and for datagrams.
+ */
+static dissector_table_t http3_wt_protocol_table;
+static dissector_table_t http3_wt_protocol_datagram_table;
 
 static int http3_follow_tap;
 
@@ -225,6 +234,10 @@ static int hf_http3_datagram;
 static int hf_http3_datagram_quarter_stream_id;
 static int hf_http3_datagram_request_stream_id;
 static int hf_http3_datagram_payload;
+static int hf_http3_wt_signal;
+static int hf_http3_wt_session_id;
+static int hf_http3_wt_protocol;
+static int hf_http3_wt_data;
 
 static expert_field ei_http3_qpack_failed;
 static expert_field ei_http3_prefix_int_failed;
@@ -296,6 +309,10 @@ static const fragment_items http3_body_fragment_items = {
 #define HTTP3_HEADER_NAME_PROTOCOL          ":protocol"
 #define HTTP3_HEADER_NAME_SCHEME            ":scheme"
 #define HTTP3_HEADER_NAME_STATUS            ":status"
+#define HTTP3_HEADER_NAME_CAPSULE_PROTOCOL  "capsule-protocol"
+/* draft-ietf-webtrans-http3-16 and later, Section 3.3. */
+#define HTTP3_HEADER_NAME_WT_AVAILABLE      "wt-available-protocols"
+#define HTTP3_HEADER_NAME_WT_PROTOCOL       "wt-protocol"
 
 #define HTTP3_HEADER_METHOD_CONNECT         "CONNECT"
 #define HTTP3_HEADER_STATUS_PARTIAL_CONTENT "206"
@@ -362,7 +379,7 @@ static const val64_string http3_frame_types[] = {
     { HTTP3_MAX_PUSH_ID, "MAX_PUSH_ID" },
     { 0x0e, "Reserved" }, // "DUPLICATE_PUSH" in draft-26 and before
     /* 0x40 - 0x3FFFFFFFFFFFFFFF Assigned via Specification Required policy */
-    { HTTP3_WEBTRANSPORT_BISTREAM, "WEBTRANSPORT_BISTREAM" }, // draft-ietf-webtrans-http3-03
+    { HTTP3_WEBTRANSPORT_BISTREAM, "WEBTRANSPORT_STREAM" }, // draft-ietf-webtrans-http3
     { HTTP3_PRIORITY_UPDATE_REQUEST_STREAM, "PRIORITY_UPDATE" }, // RFC 9218
     { HTTP3_PRIORITY_UPDATE_PUSH_STREAM, "PRIORITY_UPDATE" }, // RFC 9218
     { 0, NULL }
@@ -379,6 +396,14 @@ static const val64_string http3_frame_types[] = {
 #define HTTP3_H3_DATAGRAM                       0x33        /* rfc9297 */
 #define HTTP3_H3_DATAGRAM_DRAFT04               0xffd277    /* draft-ietf-masque-h3-datagram-04 */
 #define HTTP3_WEBTRANSPORT                      0x2b603742  /* draft-ietf-webtrans-http3-03 */
+/* draft-ietf-webtrans-http3, Section 9.2. */
+#define HTTP3_WT_INITIAL_MAX_DATA               0x2b61
+#define HTTP3_WT_INITIAL_MAX_STREAMS_UNI        0x2b64
+#define HTTP3_WT_INITIAL_MAX_STREAMS_BIDI       0x2b65
+#define HTTP3_WT_MAX_SESSIONS                   0x14e9cd29  /* drafts 13 and 14 */
+#define HTTP3_WEBTRANSPORT_MAX_SESSIONS         0xc671706a  /* draft 12 and earlier */
+#define HTTP3_WT_ENABLED_DRAFT16                0x2c7cf000  /* drafts 15 and 16 */
+#define HTTP3_WT_ENABLED                        0x20b8933b  /* draft 17 */
 
 static const val64_string http3_settings_vals[] = {
     { HTTP3_QPACK_MAX_TABLE_CAPACITY, "Max Table Capacity" },
@@ -386,6 +411,13 @@ static const val64_string http3_settings_vals[] = {
     { HTTP3_QPACK_BLOCKED_STREAMS, "Blocked Streams" },
     { HTTP3_EXTENDED_CONNECT, "Extended CONNECT" },
     { HTTP3_WEBTRANSPORT, "Enable WebTransport" },
+    { HTTP3_WT_INITIAL_MAX_DATA, "WT Initial Max Data" },
+    { HTTP3_WT_INITIAL_MAX_STREAMS_UNI, "WT Initial Max Streams Uni" },
+    { HTTP3_WT_INITIAL_MAX_STREAMS_BIDI, "WT Initial Max Streams Bidi" },
+    { HTTP3_WT_MAX_SESSIONS, "WT Max Sessions" },
+    { HTTP3_WEBTRANSPORT_MAX_SESSIONS, "WebTransport Max Sessions" },
+    { HTTP3_WT_ENABLED_DRAFT16, "WT Enabled (draft 15/16)" },
+    { HTTP3_WT_ENABLED, "WT Enabled" },
     { HTTP3_H3_DATAGRAM, "Enable Datagram" },
     { HTTP3_H3_DATAGRAM_DRAFT04, "Enable Datagram Draft04" },
     { 0, NULL }
@@ -473,6 +505,17 @@ typedef struct _http3_stream_info {
     uint32_t             response_frame_num;   /**< Frame number of response first HEADERS frame */
     bool                 is_connect;           /**< Method is CONNECT (plain or extended) */
     http3_pseudo_header_fields_t pseudo_headers;
+    /* Extended CONNECT streams. */
+    bool                 capsule_protocol;     /**< Message content is a sequence of capsules */
+    const char          *wt_protocol;          /**< Negotiated WT-Protocol */
+    const char          *wt_offered;           /**< First WT-Available-Protocols entry */
+    unsigned             wt_offered_count;
+    /* WebTransport streams (unidirectional type 0x54, or signal 0x41). */
+    bool                 is_wt_stream;
+    bool                 wt_opener_is_server;
+    uint64_t             wt_session_id;        /**< Stream ID of the CONNECT request */
+    uint64_t             wt_data_start;        /**< Stream offset of the opener's application data */
+    void                *wt_slots[2];          /**< Application protocol stream state, by direction */
 } http3_stream_info_t;
 
 /**
@@ -1113,6 +1156,56 @@ http3_get_header_value(packet_info *pinfo, const char* name, bool the_other_dire
     return NULL;
 }
 
+/*
+ * Parse a Structured Fields String Item or List of Strings (RFC 9651), as
+ * used by WT-Protocol and WT-Available-Protocols. Returns the first string
+ * (file scope) and the number of list members, ignoring any parameters.
+ */
+static const char *
+http3_parse_sf_strings(const char *value, unsigned *count)
+{
+    const char *first = NULL;
+    const char *p = value;
+
+    *count = 0;
+    while (*p) {
+        const char *start, *end;
+
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        if (*p == '"') {
+            start = ++p;
+            while (*p && *p != '"') {
+                p += (*p == '\\' && p[1]) ? 2 : 1;
+            }
+            end = p;
+            if (*p == '"') {
+                p++;
+            }
+        } else {
+            /* Not a String; tolerate a bare token. */
+            start = p;
+            while (*p && *p != ',' && *p != ';' && *p != ' ') {
+                p++;
+            }
+            end = p;
+        }
+        if (first == NULL) {
+            first = wmem_strndup(wmem_file_scope(), start, end - start);
+        }
+        (*count)++;
+        /* Skip parameters. */
+        while (*p && *p != ',') {
+            p++;
+        }
+    }
+    return first;
+}
+
 static void
 populate_http3_header_tracking(packet_info *pinfo _U_, http3_stream_info_t *http3_stream,
     const char *header_name, const char *header_value)
@@ -1165,6 +1258,16 @@ populate_http3_header_tracking(packet_info *pinfo _U_, http3_stream_info_t *http
         http3_stream->pseudo_headers.authority = wmem_strdup(wmem_file_scope(), header_value);
     } else if (strcmp(header_name, HTTP3_HEADER_NAME_SCHEME) == 0) {
         http3_stream->pseudo_headers.scheme = wmem_strdup(wmem_file_scope(), header_value);
+    } else if (strcmp(header_name, HTTP3_HEADER_NAME_CAPSULE_PROTOCOL) == 0) {
+        /* RFC 9297, Section 3.4: a Structured Fields Boolean. */
+        http3_stream->capsule_protocol = strcmp(header_value, "?1") == 0;
+    } else if (strcmp(header_name, HTTP3_HEADER_NAME_WT_PROTOCOL) == 0) {
+        unsigned count;
+
+        http3_stream->wt_protocol = http3_parse_sf_strings(header_value, &count);
+    } else if (strcmp(header_name, HTTP3_HEADER_NAME_WT_AVAILABLE) == 0) {
+        http3_stream->wt_offered = http3_parse_sf_strings(header_value,
+                                                         &http3_stream->wt_offered_count);
     } else if (strcmp(header_name, HTTP3_HEADER_NAME_STATUS) == 0) {
         unsigned status_code;
 
@@ -1506,6 +1609,18 @@ decode_http3_headers(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, unsign
                 http3_stream->upgrade_info->server_port = pinfo->destport;
                 http3_stream->upgrade_info->http_version = 3;
                 http3_stream->upgrade_info->get_header_value = http3_get_header_value;
+                /*
+                 * WebTransport (draft-ietf-webtrans-http3) and MASQUE
+                 * (RFC 9298, RFC 9484, connect-ethernet) use the Capsule
+                 * Protocol whether or not Capsule-Protocol is sent.
+                 */
+                if (strcmp(http3_stream->protocol, "webtransport") == 0 ||
+                    strcmp(http3_stream->protocol, "webtransport-h3") == 0 ||
+                    strcmp(http3_stream->protocol, "connect-udp") == 0 ||
+                    strcmp(http3_stream->protocol, "connect-ip") == 0 ||
+                    strcmp(http3_stream->protocol, "connect-ethernet") == 0) {
+                    http3_stream->capsule_protocol = true;
+                }
             }
         }
 
@@ -2091,6 +2206,147 @@ dissect_http3_priority_update(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree 
     return offset;
 }
 
+/* The request stream with the given ID, if HTTP/3 has seen it. */
+static http3_stream_info_t *
+http3_lookup_request_stream(packet_info *pinfo, struct quic_info_data *quic_info, uint64_t stream_id)
+{
+    quic_stream_info request = {
+        .stream_id = stream_id,
+        .quic_info = quic_info,
+        .from_server = false,   /* Both directions share the client's state. */
+    };
+
+    if (QUIC_STREAM_TYPE(stream_id) != QUIC_STREAM_CLIENT_BIDI) {
+        return NULL;
+    }
+    return (http3_stream_info_t *)quic_stream_get_proto_data(pinfo, &request);
+}
+
+/*
+ * The WebTransport application protocol of a session: the server's
+ * WT-Protocol, or else the only protocol the client offered.
+ */
+static const char *
+http3_wt_session_protocol(const http3_stream_info_t *session)
+{
+    if (session == NULL) {
+        return NULL;
+    }
+    if (session->wt_protocol) {
+        return session->wt_protocol;
+    }
+    return session->wt_offered_count == 1 ? session->wt_offered : NULL;
+}
+
+static void
+http3_dissect_capsules(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
+                       quic_stream_info *stream_info, http3_stream_info_t *http3_stream)
+{
+    http_capsule_info_t info = {
+        .protocol = http3_stream->protocol,
+        .from_server = stream_info->from_server,
+    };
+    const char *wt_protocol = http3_wt_session_protocol(http3_stream);
+
+    /* A DATAGRAM capsule carries what an HTTP Datagram would (RFC 9297). */
+    if (wt_protocol) {
+        info.datagram_handle = dissector_get_string_handle(http3_wt_protocol_datagram_table,
+                                                           wt_protocol);
+    }
+    call_dissector_with_data(http3_capsule_handle, tvb, pinfo, tree, &info);
+}
+
+/*
+ * Hand the application data of a WebTransport stream, from offset on, to the
+ * session's application protocol. The subdissector sees stream offsets that
+ * start at its own data, and keeps its stream state apart from HTTP/3's.
+ */
+static void
+http3_dissect_wt_data(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, int offset,
+                      quic_stream_info *stream_info, http3_stream_info_t *http3_stream)
+{
+    http3_stream_info_t *session;
+    const char          *protocol;
+    proto_item          *ti;
+    tvbuff_t            *next_tvb;
+    quic_stream_info     wt_info;
+    bool                 from_opener;
+
+    session = http3_lookup_request_stream(pinfo, stream_info->quic_info, http3_stream->wt_session_id);
+    protocol = http3_wt_session_protocol(session);
+    if (protocol) {
+        ti = proto_tree_add_string(tree, hf_http3_wt_protocol, tvb, offset, 0, protocol);
+        proto_item_set_generated(ti);
+    }
+    if (tvb_reported_length_remaining(tvb, offset) <= 0) {
+        return;
+    }
+
+    next_tvb = tvb_new_subset_remaining(tvb, offset);
+    from_opener = stream_info->from_server == http3_stream->wt_opener_is_server;
+    wt_info = *stream_info;
+    wt_info.offset = stream_info->offset + offset -
+                     (uint32_t)(from_opener ? http3_stream->wt_data_start : 0);
+    wt_info.subdissector_slots = http3_stream->wt_slots;
+
+    if (protocol) {
+        uint32_t saved_desegment_len = pinfo->desegment_len;
+        uint16_t saved_can_desegment = pinfo->can_desegment;
+        int      handled;
+
+        /*
+         * QUIC reassembles for HTTP/3, so let the application protocol ask
+         * for more stream data as if QUIC had called it directly.
+         */
+        if (pinfo->can_desegment > 0) {
+            pinfo->can_desegment = 2;
+        }
+        pinfo->desegment_len = 0;
+        handled = dissector_try_string_with_data(http3_wt_protocol_table, protocol, next_tvb,
+                                                 pinfo, proto_tree_get_root(tree), true, &wt_info);
+        pinfo->can_desegment = saved_can_desegment;
+        if (handled) {
+            if (pinfo->desegment_len) {
+                /* The subdissector's offsets are relative to its own data. */
+                pinfo->desegment_offset += offset;
+            } else {
+                pinfo->desegment_len = saved_desegment_len;
+            }
+            return;
+        }
+        pinfo->desegment_len = saved_desegment_len;
+    }
+    proto_tree_add_item(tree, hf_http3_wt_data, next_tvb, 0, -1, ENC_NA);
+}
+
+/* Session ID, at the start of a WebTransport stream after its type or signal. */
+static bool
+http3_dissect_wt_header(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, int *offset,
+                        quic_stream_info *stream_info, http3_stream_info_t *http3_stream)
+{
+    uint64_t session_id;
+    int      lenvar;
+
+    if (!try_get_quic_varint(tvb, *offset, &session_id, &lenvar)) {
+        if (pinfo->can_desegment && !stream_info->fin) {
+            pinfo->desegment_offset = 0;
+            pinfo->desegment_len = DESEGMENT_ONE_MORE_SEGMENT;
+        }
+        return false;
+    }
+    proto_tree_add_uint64(tree, hf_http3_wt_session_id, tvb, *offset, lenvar, session_id);
+    *offset += lenvar;
+    if (!PINFO_FD_VISITED(pinfo)) {
+        http3_stream->is_wt_stream = true;
+        http3_stream->wt_session_id = session_id;
+        http3_stream->wt_opener_is_server = stream_info->from_server;
+        http3_stream->wt_data_start = stream_info->offset + (uint64_t)*offset;
+    }
+    col_append_sep_fstr(pinfo->cinfo, COL_INFO, ", ", "WebTransport (session %" PRIu64 ")",
+                        session_id);
+    return true;
+}
+
 static int
 dissect_http3_frame(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, int offset, quic_stream_info *stream_info, http3_stream_info_t *http3_stream)
 {
@@ -2143,7 +2399,11 @@ dissect_http3_frame(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, int off
     switch (frame_type) {
     case HTTP3_DATA: { /* TODO: dissect Data Frame */
         tvbuff_t *next_tvb = tvb_new_subset_length(tvb, offset, payload_length);
-        dissect_http3_data(next_tvb, pinfo, ft_tree, 0, stream_info, http3_stream, fin);
+        if (http3_stream->capsule_protocol && http3_capsule_handle) {
+            http3_dissect_capsules(next_tvb, pinfo, ft_tree, stream_info, http3_stream);
+        } else {
+            dissect_http3_data(next_tvb, pinfo, ft_tree, 0, stream_info, http3_stream, fin);
+        }
         fin = false;
     } break;
     case HTTP3_HEADERS: {
@@ -3032,7 +3292,17 @@ dissect_http3_uni_stream(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, in
         offset = dissect_http3_qpack_dec(tvb, pinfo, stream_tree, offset, stream_info, http3_stream);
         break;
     case HTTP3_STREAM_TYPE_WEBTRANSPORT:
-        // TODO
+        /* draft-ietf-webtrans-http3, Section 4.2: Session ID, then data. */
+        if (stream_info->offset == 0) {
+            if (!http3_dissect_wt_header(tvb, pinfo, stream_tree, &offset, stream_info,
+                                         http3_stream)) {
+                return tvb_captured_length(tvb);
+            }
+        } else {
+            proto_item_set_generated(proto_tree_add_uint64(stream_tree, hf_http3_wt_session_id,
+                                                           tvb, 0, 0, http3_stream->wt_session_id));
+        }
+        http3_dissect_wt_data(tvb, pinfo, stream_tree, offset, stream_info, http3_stream);
         offset = tvb_captured_length(tvb);
         break;
     default:
@@ -3048,6 +3318,59 @@ dissect_http3_uni_stream(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, in
     }
 
     return offset;
+}
+
+/*
+ * A bidirectional stream opened with the WEBTRANSPORT_STREAM signal (0x41)
+ * and a Session ID (draft-ietf-webtrans-http3, Section 4.3). Only the opener
+ * sends the signal; the peer's data on the stream starts at offset 0.
+ */
+static bool
+http3_is_wt_bidi_stream(tvbuff_t *tvb, quic_stream_info *stream_info,
+                        http3_stream_info_t *http3_stream)
+{
+    uint64_t signal;
+    int      lenvar;
+    bool     opener_is_server = (stream_info->stream_id & 1) != 0;
+
+    if (http3_stream->is_wt_stream) {
+        return true;
+    }
+    return stream_info->offset == 0 && stream_info->from_server == opener_is_server &&
+           try_get_quic_varint(tvb, 0, &signal, &lenvar) &&
+           signal == HTTP3_WEBTRANSPORT_BISTREAM;
+}
+
+static void
+dissect_http3_wt_bidi_stream(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
+                             quic_stream_info *stream_info, http3_stream_info_t *http3_stream)
+{
+    proto_item *ti_stream;
+    proto_tree *stream_tree;
+    int         offset = 0;
+    bool        from_opener = stream_info->from_server == ((stream_info->stream_id & 1) != 0);
+
+    ti_stream = proto_tree_add_item(tree, hf_http3_stream_bidi, tvb, 0, -1, ENC_NA);
+    stream_tree = proto_item_add_subtree(ti_stream, ett_http3_stream_bidi);
+    proto_item_set_generated(proto_tree_add_uint64(stream_tree, hf_http3_stream_id, tvb, 0, 0,
+                                                   http3_stream->id));
+    proto_item_append_text(ti_stream, " (WebTransport)");
+
+    if (stream_info->offset == 0 && from_opener) {
+        unsigned lenvar;
+
+        proto_tree_add_item_ret_varint(stream_tree, hf_http3_wt_signal, tvb, 0, -1,
+                                       ENC_VARINT_QUIC, NULL, &lenvar);
+        offset += lenvar;
+        if (!http3_dissect_wt_header(tvb, pinfo, stream_tree, &offset, stream_info,
+                                     http3_stream)) {
+            return;
+        }
+    } else {
+        proto_item_set_generated(proto_tree_add_uint64(stream_tree, hf_http3_wt_session_id, tvb,
+                                                       0, 0, http3_stream->wt_session_id));
+    }
+    http3_dissect_wt_data(tvb, pinfo, stream_tree, offset, stream_info, http3_stream);
 }
 
 static proto_tree *
@@ -3088,10 +3411,31 @@ dissect_http3(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
      * the QUIC stream just abruptly stop like a RESET_STREAM? For that matter,
      * should we try to reassemble any leftover data on a RESET_STREAM? */
 
+    /*
+     * We need a single HTTP/3 stream for both directions of a bidirectional
+     * stream, kept with the direction of the endpoint that opened it.
+     */
+    bool is_bidi = QUIC_STREAM_TYPE(stream_info->stream_id) == QUIC_STREAM_CLIENT_BIDI ||
+                   QUIC_STREAM_TYPE(stream_info->stream_id) == QUIC_STREAM_SERVER_BIDI;
+    from_server = stream_info->from_server;
+    if (is_bidi) {
+        stream_info->from_server = (stream_info->stream_id & 1) != 0;
+    }
+    http3_stream = (http3_stream_info_t *)quic_stream_get_proto_data(pinfo, stream_info);
+    if (!http3_stream) {
+        http3_stream = wmem_new0(wmem_file_scope(), http3_stream_info_t);
+        nstime_set_unset(&http3_stream->request_ts);
+        quic_stream_add_proto_data(pinfo, stream_info, http3_stream);
+        http3_stream->id               = stream_info->stream_id;
+    }
+    stream_info->from_server = from_server;
+
+    bool is_wt_bidi = is_bidi && http3_is_wt_bidi_stream(tvb, stream_info, http3_stream);
+
     switch (QUIC_STREAM_TYPE(stream_info->stream_id)) {
     case QUIC_STREAM_CLIENT_BIDI:
         /* Used for HTTP requests and responses. */
-        if (!http3_check_frame_size(tvb, pinfo, offset)) {
+        if (!is_wt_bidi && !http3_check_frame_size(tvb, pinfo, offset)) {
             return tvb_captured_length(tvb);
         }
         break;
@@ -3106,22 +3450,6 @@ dissect_http3(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
 
     http3_tree = start_http3_tree(tvb, pinfo, tree);
 
-    /* We need a single HTTP/3 stream for both directions */
-    from_server = stream_info->from_server;
-    if (QUIC_STREAM_TYPE(stream_info->stream_id) == QUIC_STREAM_CLIENT_BIDI && from_server) {
-        stream_info->from_server = false;
-    }
-    http3_stream = (http3_stream_info_t *)quic_stream_get_proto_data(pinfo, stream_info);
-    if (!http3_stream) {
-        http3_stream = wmem_new0(wmem_file_scope(), http3_stream_info_t);
-        nstime_set_unset(&http3_stream->request_ts);
-        quic_stream_add_proto_data(pinfo, stream_info, http3_stream);
-        http3_stream->id               = stream_info->stream_id;
-    }
-    if (QUIC_STREAM_TYPE(stream_info->stream_id) == QUIC_STREAM_CLIENT_BIDI && from_server) {
-        stream_info->from_server = true;
-    }
-
     http3_session = http3_session_lookup_or_create(pinfo);
     http3_session->current_stream = http3_stream;
     http3_stream->direction = http3_packet_get_direction(stream_info);
@@ -3133,6 +3461,12 @@ dissect_http3(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
     // If a STREAM has unknown data, everything afterwards cannot be dissected.
     if (http3_stream->broken_from_offset && http3_stream->broken_from_offset <= stream_info->offset + offset) {
         report_unknown_stream_type(tvb, pinfo, tree, offset, stream_info, http3_stream);
+        return tvb_captured_length(tvb);
+    }
+
+    if (is_wt_bidi) {
+        /* WebTransport, on a client or server initiated stream. */
+        dissect_http3_wt_bidi_stream(tvb, pinfo, http3_tree, stream_info, http3_stream);
         return tvb_captured_length(tvb);
     }
 
@@ -3190,6 +3524,19 @@ dissect_http3_datagram(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void
     proto_item_set_generated(ti);
     offset += lenvar;
 
+    http3_stream_info_t *request = http3_lookup_request_stream(pinfo, datagram_info->quic_info,
+                                                               request_stream_id);
+    const char          *wt_protocol = http3_wt_session_protocol(request);
+    tvbuff_t            *payload_tvb = tvb_new_subset_remaining(tvb, offset);
+
+    if (wt_protocol) {
+        ti = proto_tree_add_string(datragram_tree, hf_http3_wt_protocol, tvb, offset, 0, wt_protocol);
+        proto_item_set_generated(ti);
+        if (dissector_try_string_with_data(http3_wt_protocol_datagram_table, wt_protocol,
+                                           payload_tvb, pinfo, tree, true, datagram_info)) {
+            return tvb_captured_length(tvb);
+        }
+    }
     proto_tree_add_item(datragram_tree, hf_http3_datagram_payload, tvb, offset, -1, ENC_NA);
 
     return tvb_captured_length(tvb);
@@ -3865,6 +4212,26 @@ proto_register_http3(void)
               FT_BYTES, BASE_NONE, NULL, 0x0,
               NULL, HFILL }
         },
+        { &hf_http3_wt_signal,
+            { "Signal Value", "http3.webtransport.signal",
+              FT_UINT64, BASE_HEX | BASE_VAL64_STRING, VALS64(http3_frame_types), 0x0,
+              "WEBTRANSPORT_STREAM, which opens a bidirectional WebTransport stream", HFILL }
+        },
+        { &hf_http3_wt_session_id,
+            { "Session ID", "http3.webtransport.session_id",
+              FT_UINT64, BASE_DEC, NULL, 0x0,
+              "Stream ID of the extended CONNECT request that established the session", HFILL }
+        },
+        { &hf_http3_wt_protocol,
+            { "Application Protocol", "http3.webtransport.protocol",
+              FT_STRING, BASE_NONE, NULL, 0x0,
+              "WebTransport application protocol, from WT-Protocol", HFILL }
+        },
+        { &hf_http3_wt_data,
+            { "Stream Data", "http3.webtransport.data",
+              FT_BYTES, BASE_NONE, NULL, 0x0,
+              "WebTransport application data", HFILL }
+        },
     };
 
     static int *ett[] = {&ett_http3,
@@ -3947,6 +4314,12 @@ proto_register_http3(void)
 
     http3_handle = register_dissector("http3", dissect_http3, proto_http3);
     http3_datagram_handle = register_dissector("http3.datagram", dissect_http3_datagram, proto_http3);
+    http3_wt_protocol_table = register_dissector_table(
+        "http3.wt.protocol", "WebTransport application protocol (WT-Protocol)",
+        proto_http3, FT_STRING, STRING_CASE_SENSITIVE);
+    http3_wt_protocol_datagram_table = register_dissector_table(
+        "http3.wt.protocol.datagram", "WebTransport application protocol datagrams",
+        proto_http3, FT_STRING, STRING_CASE_SENSITIVE);
 #ifdef HAVE_NGHTTP3
     /* Fill hash table with static headers */
     register_static_headers();
@@ -3984,6 +4357,8 @@ proto_reg_handoff_http3(void)
         http_eo_tap = find_tap_id(get_eo_tap_listener_name(http_eo));
     }
 #endif
+
+    http3_capsule_handle = find_dissector_add_dependency("capsule", proto_http3);
 
     dissector_add_string("quic.proto", "h3", http3_handle);
     dissector_add_string("quic.proto.datagram", "h3", http3_datagram_handle);
