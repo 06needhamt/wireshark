@@ -2854,40 +2854,143 @@ class TestDissectMoqt:
         vi = self._vi64
         parameters = self._parameters
         packets = (
-            # 0x21 is SUBSCRIPTION_FILTER (length prefixed) in draft 18 and
-            # LOCATION_FILTER in draft 22, so only one draft accepts each form.
+            # 0x21 is SUBSCRIPTION_FILTER through draft 19, a length-prefixed
+            # list of LOCATION_FILTER fields in drafts 20 and 21, and a typed
+            # LOCATION_FILTER from draft 22.
             self._message(0x02, vi(2) + parameters(((0x21, vi(1) + vi(2)),))),
             self._message(0x02, vi(2) + parameters(((0x21, vi(2) + vi(7) + vi(1)),))),
+            # PUBLISH_OK is reserved from draft 19.
             self._message(0x1e, parameters(())),
+            # PUBLISH_STATE_NOTIFY is new in draft 20.
             self._message(0x22, parameters(())),
-            # End of Timed-Out Range is a draft-22 FETCH marker.
+            # End of Timed-Out Range is a FETCH marker from draft 20.
             vi(5) + vi(4) + vi(0x20c) + vi(1) + vi(2),
         )
         results = {}
-        for draft in (18, 22):
+        for draft in (18, 19, 20, 21, 22):
             capture_path = self._make_capture(
                 cmd_text2pcap, result_file, base_env,
                 f'moqt-differences-{draft}', 'moqt', packets, draft=draft)
             results[draft] = self._field_rows(
                 cmd_tshark, capture_path, test_env, 'moqt',
                 ('moqt.draft', 'moqt.filter.type', 'moqt.location_filter.type',
-                 'moqt.stream.unknown', 'moqt.type.invalid', '_ws.col.info'))
+                 'moqt.filter.start_group', 'moqt.stream.unknown',
+                 'moqt.type.invalid', '_ws.col.info'))
         # Without QUIC metadata, a message unknown to the draft is not
         # recognised as a control message, leaving an unknown stream type.
-        assert results[18] == [
-            ['18', '2', '', '', '', 'REQUEST_UPDATE'],
-            ['18', '7', '', '', '1', 'REQUEST_UPDATE'],
-            ['18', '', '', '', '', 'PUBLISH_OK'],
-            ['18', '', '', '1', '', ''],
-            ['18', '', '', '', '1', 'Fetch Header (Request ID 4), Fetch Object'],
-        ]
+        for draft in (18, 19):
+            assert results[draft] == [
+                [str(draft), '2', '', '', '', '', 'REQUEST_UPDATE'],
+                [str(draft), '7', '', '', '', '1', 'REQUEST_UPDATE'],
+                [str(draft), '', '', '', '', '', 'PUBLISH_OK'] if draft == 18 else
+                [str(draft), '', '', '', '1', '', ''],
+                [str(draft), '', '', '', '1', '', ''],
+                [str(draft), '', '', '', '', '1',
+                 'Fetch Header (Request ID 4), Fetch Object'],
+            ]
+        for draft in (20, 21):
+            assert results[draft] == [
+                [str(draft), '', '', '2', '', '', 'REQUEST_UPDATE'],
+                [str(draft), '', '', '7', '', '', 'REQUEST_UPDATE'],
+                [str(draft), '', '', '', '1', '', ''],
+                [str(draft), '', '', '', '', '', 'PUBLISH_STATE_NOTIFY'],
+                [str(draft), '', '', '', '', '', 'Fetch Header (Request ID 4), End of Range'],
+            ]
         assert results[22] == [
-            ['22', '', '1', '', '', 'REQUEST_UPDATE'],
-            ['22', '', '2', '', '', 'REQUEST_UPDATE'],
-            ['22', '', '', '1', '', ''],
-            ['22', '', '', '', '', 'PUBLISH_STATE_NOTIFY'],
-            ['22', '', '', '', '', 'Fetch Header (Request ID 4), End of Range'],
+            ['22', '', '1', '2', '', '', 'REQUEST_UPDATE'],
+            ['22', '', '2', '7', '', '', 'REQUEST_UPDATE'],
+            ['22', '', '', '', '1', '', ''],
+            ['22', '', '', '', '', '', 'PUBLISH_STATE_NOTIFY'],
+            ['22', '', '', '', '', '', 'Fetch Header (Request ID 4), End of Range'],
         ]
+
+    def test_moqt_draft19_control_messages(
+            self, cmd_text2pcap, cmd_tshark, result_file,
+            base_env, test_env):
+        '''Draft 19 keeps the draft-18 FETCH but adds Range Filters.'''
+        vi = self._vi64
+        namespace = self._namespace
+        parameters = self._parameters
+        lp = lambda value: vi(len(value)) + value  # noqa: E731
+        track = namespace((b'live', b'demo')) + vi(5) + b'video'
+
+        setup = self._message(0x2f00, self._key_values(((0x06, vi(8)), (0x08, vi(4)))))
+        packets = (
+            # GOAWAY on the control stream no longer carries a Request ID.
+            setup + self._message(0x10, vi(0) + vi(100)),
+            # A Standalone FETCH with an OBJECTID_FILTER Range Filter.
+            self._message(0x16, vi(4) + vi(1) + track + vi(1) + vi(0) + vi(3) + vi(0) +
+                          parameters(((0x26, lp(bytes((1,)) + vi(3) + vi(2))),))),
+            self._message(0x0f, namespace((b'demo',)) + vi(5) + b'audio'),
+            self._message(0x05, vi(0x32) + vi(0) + vi(0)),
+            self._message(0x05, vi(0x19) + vi(0) + vi(0)),
+            self._message(0x0b, vi(3) + vi(0) + vi(0)),
+        )
+        capture_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env,
+            'moqt-draft19-control', 'moqt', packets, draft=19)
+
+        fields = self._field_rows
+        assert fields(cmd_tshark, capture_path, test_env, 'moqt',
+                      ('_ws.col.info',)) == [
+            ['SETUP, GOAWAY'], ['FETCH'], ['PUBLISH_SKIPPED'],
+            ['REQUEST_ERROR (INVALID_JOINING_REQUEST_ID)'],
+            ['REQUEST_ERROR (Unknown)'],
+            ['PUBLISH_DONE (SUBSCRIPTION_ENDED)']]
+        assert fields(cmd_tshark, capture_path, test_env, 'moqt.message.type == 0x10',
+                      ('moqt.setup.option.type', 'moqt.request_id', 'moqt.timeout',
+                       'moqt.unparsed')) == [['6,8', '', '100', '']]
+        assert fields(cmd_tshark, capture_path, test_env, 'moqt.message.type == 0x16',
+                      ('moqt.request_id', 'moqt.fetch.type', 'moqt.group_id',
+                       'moqt.parameter.type', 'moqt.range.start', 'moqt.range.end')) == [
+            ['4', '1', '1,3', '38', '3', '5']]
+        assert self._matching_frames(
+            cmd_tshark, capture_path, test_env,
+            '_ws.malformed || _ws.expert.severity == error') == []
+
+    @pytest.mark.parametrize('draft', (20, 21))
+    def test_moqt_draft20_location_filter(
+            self, cmd_text2pcap, cmd_tshark, result_file,
+            base_env, test_env, draft):
+        '''Drafts 20 and 21 list only the LOCATION_FILTER fields present.'''
+        vi = self._vi64
+        namespace = self._namespace
+        parameters = self._parameters
+        lp = lambda value: vi(len(value)) + value  # noqa: E731
+        track = namespace((b'live',)) + vi(5) + b'video'
+
+        def update(value):
+            return self._message(0x02, vi(2) + parameters(((0x21, lp(value)),)))
+
+        packets = (
+            self._message(0x16, vi(4) + track + parameters((
+                (0x21, lp(vi(0) + vi(0) + vi(2) + vi(5))),
+                (0x23, lp(parameters(((0x0a, vi(250)),)))),
+                (0x35, bytes((1,)))))),
+            update(b''),
+            update(vi(0) + vi(0)),
+            update(vi(1) + vi(2) + vi(3) + vi(4) + vi(5)),
+            self._message(0x10, vi(0) + vi(100)),
+        )
+        capture_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env,
+            f'moqt-draft{draft}-location-filter', 'moqt', packets, draft=draft)
+
+        assert self._field_rows(
+            cmd_tshark, capture_path, test_env, 'moqt',
+            ('_ws.col.info', 'moqt.filter.start_group', 'moqt.filter.start_object',
+             'moqt.filter.end_group_delta', 'moqt.filter.end_object',
+             'moqt.parameter.varint', 'moqt.parameter.uint8',
+             'moqt.length.invalid')) == [
+            ['FETCH', '0', '0', '2', '5', '250', '1', ''],
+            ['REQUEST_UPDATE', '', '', '', '', '', '', ''],
+            ['REQUEST_UPDATE', '0', '0', '', '', '', '', ''],
+            ['REQUEST_UPDATE', '1', '2', '3', '4', '', '', '1'],
+            ['GOAWAY', '', '', '', '', '', '', ''],
+        ]
+        # Only the five-field filter is malformed.
+        assert self._matching_frames(
+            cmd_tshark, capture_path, test_env, '_ws.malformed') == ['4']
 
     @pytest.mark.parametrize('draft', (18, 22))
     def test_moqt_immutable_properties(

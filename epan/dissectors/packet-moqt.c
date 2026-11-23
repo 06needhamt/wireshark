@@ -1,6 +1,6 @@
 /* packet-moqt.c
  * Routines for Media over QUIC Transport (MOQT) dissection
- * draft-ietf-moq-transport-18, -22 and -23
+ * draft-ietf-moq-transport-18 through -23
  *
  * Wireshark - Network traffic analyzer
  * By Gerald Combs <gerald@wireshark.org>
@@ -32,12 +32,25 @@
  * reuses the draft-18 stream and datagram parsers.
  * Draft 23 uses vi64 message lengths, counted FILL_PARAMETERS, Error Details,
  * and new FETCH indicators. Its descriptors override only changed layouts.
+ *
+ * Drafts 19 to 21 sit between 18 and 22 and share their stream layouts:
+ *  - Draft 19 withdrew PUBLISH_OK, renamed PUBLISH_BLOCKED to PUBLISH_SKIPPED,
+ *    dropped the GOAWAY Request ID, added the Range Filter parameters and
+ *    replaced DUPLICATE_SUBSCRIPTION with the filter request errors. FETCH
+ *    and SUBSCRIPTION_FILTER keep their draft-18 layouts.
+ *  - Draft 20 introduced the draft-22 FETCH, PUBLISH_STATE_NOTIFY,
+ *    FILL_PARAMETERS and INCLUDE_PROPERTIES, but its LOCATION_FILTER is
+ *    length prefixed and lists only the fields present.
+ *  - Draft 21 is an editorial restructure of draft 20, identical on the wire.
  */
 
 void proto_register_moqt(void);
 void proto_reg_handoff_moqt(void);
 
 #define MOQT_ALPN_DRAFT_18 "moqt-18"
+#define MOQT_ALPN_DRAFT_19 "moqt-19"
+#define MOQT_ALPN_DRAFT_20 "moqt-20"
+#define MOQT_ALPN_DRAFT_21 "moqt-21"
 #define MOQT_ALPN_DRAFT_22 "moqt-22"
 #define MOQT_ALPN_DRAFT_23 "moqt-23"
 
@@ -149,8 +162,8 @@ void proto_reg_handoff_moqt(void);
 
 static dissector_handle_t moqt_handle;              /* latest draft */
 static dissector_handle_t moqt_datagram_handle;
-static dissector_handle_t moqt_handles[3];          /* indexed as moqt_drafts */
-static dissector_handle_t moqt_datagram_handles[3];
+static dissector_handle_t moqt_handles[6];          /* indexed as moqt_drafts */
+static dissector_handle_t moqt_datagram_handles[6];
 
 static int proto_moqt;
 
@@ -355,6 +368,30 @@ static const val64_string moqt_draft18_request_error_vals[] = {
     { 0x32, "INVALID_JOINING_REQUEST_ID" },
     { 0x33, "UNSUPPORTED_EXTENSION" },
     { MOQT_REQUEST_ERROR_REDIRECT, "REDIRECT" },
+    { 0, NULL }
+};
+
+/* Draft 19 section 13.8: DUPLICATE_SUBSCRIPTION withdrawn, filter errors added. */
+static const val64_string moqt_draft19_request_error_vals[] = {
+    { 0x00, "INTERNAL_ERROR" },
+    { 0x01, "UNAUTHORIZED" },
+    { 0x02, "TIMEOUT" },
+    { 0x03, "NOT_SUPPORTED" },
+    { 0x04, "MALFORMED_AUTH_TOKEN" },
+    { 0x05, "EXPIRED_AUTH_TOKEN" },
+    { 0x06, "GOING_AWAY" },
+    { 0x09, "EXCESSIVE_LOAD" },
+    { 0x10, "DOES_NOT_EXIST" },
+    { 0x11, "INVALID_RANGE" },
+    { 0x12, "MALFORMED_TRACK" },
+    { 0x20, "UNINTERESTED" },
+    { 0x30, "PREFIX_OVERLAP" },
+    { 0x31, "NAMESPACE_TOO_LARGE" },
+    { 0x32, "INVALID_JOINING_REQUEST_ID" },
+    { 0x33, "UNSUPPORTED_EXTENSION" },
+    { MOQT_REQUEST_ERROR_REDIRECT, "REDIRECT" },
+    { 0x35, "CONFLICTING_FILTERS" },
+    { 0x36, "INVALID_FILTER" },
     { 0, NULL }
 };
 
@@ -689,12 +726,18 @@ struct moqt_draft {
 };
 
 static const moqt_draft_t moqt_draft18;
+static const moqt_draft_t moqt_draft19;
+static const moqt_draft_t moqt_draft20;
+static const moqt_draft_t moqt_draft21;
 static const moqt_draft_t moqt_draft22;
 static const moqt_draft_t moqt_draft23;
 
 /* Every supported draft, oldest first; the last one is the latest. */
 static const moqt_draft_t *const moqt_drafts[] = {
     &moqt_draft18,
+    &moqt_draft19,
+    &moqt_draft20,
+    &moqt_draft21,
     &moqt_draft22,
     &moqt_draft23,
 };
@@ -1331,6 +1374,32 @@ moqt_dissect_fill_parameters(moqt_cursor_t *cursor)
     cursor->in_fill_parameters = false;
 }
 
+/*
+ * Drafts 20 and 21: LOCATION_FILTER is length prefixed and holds only the
+ * fields present, in order. An empty value is no filter, and {0, 0} is the
+ * Next Object. Draft 22 replaced the Length with a Location Filter Type.
+ */
+static void
+moqt_draft20_dissect_location_filter(moqt_cursor_t *cursor)
+{
+    static const int *const fields[] = {
+        &hf_moqt_start_group, &hf_moqt_start_object,
+        &hf_moqt_end_group_delta, &hf_moqt_end_object,
+    };
+
+    for (unsigned i = 0; i < array_length(fields) && !cursor->failed &&
+                         cursor->offset < cursor->end; i++) {
+        moqt_cursor_varint(cursor, *fields[i], NULL, "location filter field");
+    }
+    if (!cursor->failed && cursor->offset < cursor->end &&
+        cursor->phase == MOQT_DISSECT) {
+        proto_tree_add_expert_format(
+            cursor->tree, cursor->pinfo, &ei_moqt_invalid_length, cursor->tvb,
+            cursor->offset, cursor->end - cursor->offset,
+            "LOCATION_FILTER has more than four fields");
+    }
+}
+
 /* Section 10.2: type, name, wire encoding and display/decoder stay together. */
 static const moqt_parameter_descriptor_t moqt_draft18_parameters[] = {
     { MOQT_PARAM_OBJECT_DELIVERY_TIMEOUT, "OBJECT_DELIVERY_TIMEOUT",
@@ -1359,6 +1428,52 @@ static const moqt_parameter_descriptor_t moqt_draft18_parameters[] = {
       MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
     { MOQT_PARAM_TRACK_NAMESPACE_PREFIX, "TRACK_NAMESPACE_PREFIX",
       MOQT_PARAMETER_NAMESPACE, NULL, moqt_dissect_namespace_prefix },
+};
+
+/* Draft 19 section 10.2: draft 18 plus the Range Filters (#1765). */
+static const moqt_parameter_descriptor_t moqt_draft19_parameters[] = {
+    { MOQT_PARAM_OBJECT_DELIVERY_TIMEOUT, "OBJECT_DELIVERY_TIMEOUT",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_AUTHORIZATION_TOKEN, "AUTHORIZATION_TOKEN",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_token },
+    { MOQT_PARAM_RENDEZVOUS_TIMEOUT, "RENDEZVOUS_TIMEOUT",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_SUBGROUP_DELIVERY_TIMEOUT, "SUBGROUP_DELIVERY_TIMEOUT",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_EXPIRES, "EXPIRES",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_LARGEST_OBJECT, "LARGEST_OBJECT",
+      MOQT_PARAMETER_LOCATION, NULL, moqt_dissect_largest_object },
+    { MOQT_PARAM_FILL_TIMEOUT, "FILL_TIMEOUT",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_FORWARD, "FORWARD",
+      MOQT_PARAMETER_UINT8, &hf_moqt_parameter_uint8, NULL },
+    { MOQT_PARAM_SUBSCRIBER_PRIORITY, "SUBSCRIBER_PRIORITY",
+      MOQT_PARAMETER_UINT8, &hf_moqt_parameter_uint8, NULL },
+    { MOQT_PARAM_SUBSCRIPTION_FILTER, "SUBSCRIPTION_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_subscription_filter },
+    { MOQT_PARAM_GROUP_ORDER, "GROUP_ORDER",
+      MOQT_PARAMETER_UINT8, &hf_moqt_parameter_uint8, NULL },
+    { MOQT_PARAM_SUBGROUP_FILTER, "SUBGROUP_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_range_filter },
+    { MOQT_PARAM_OBJECTID_FILTER, "OBJECTID_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_range_filter },
+    { MOQT_PARAM_PRIORITY_FILTER, "PRIORITY_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_range_filter },
+    { MOQT_PARAM_OBJECT_PROPERTY_FILTER, "OBJECT_PROPERTY_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_property_range_filter },
+    { MOQT_PARAM_TRACK_PROPERTY_FILTER, "TRACK_PROPERTY_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_dissect_property_range_filter },
+    { MOQT_PARAM_NEW_GROUP_REQUEST, "NEW_GROUP_REQUEST",
+      MOQT_PARAMETER_INTEGER, &hf_moqt_parameter_varint, NULL },
+    { MOQT_PARAM_TRACK_NAMESPACE_PREFIX, "TRACK_NAMESPACE_PREFIX",
+      MOQT_PARAMETER_NAMESPACE, NULL, moqt_dissect_namespace_prefix },
+};
+
+/* Drafts 20 and 21: the draft-22 parameters with a length-prefixed filter. */
+static const moqt_parameter_descriptor_t moqt_draft20_parameters[] = {
+    { MOQT_PARAM_LOCATION_FILTER, "LOCATION_FILTER",
+      MOQT_PARAMETER_LENGTH_PREFIXED, NULL, moqt_draft20_dissect_location_filter },
 };
 
 /* Draft 22 section 9.20; FILL_TIMEOUT and RENDEZVOUS_TIMEOUT remain integers. */
@@ -2043,6 +2158,39 @@ static const moqt_message_descriptor_t moqt_draft18_messages[] = {
      * draft-18 control-message table also lists 0x1e. Accept both spellings.
      */
     { MOQT_MSG_PUBLISH_OK, "PUBLISH_OK", moqt_draft18_decode_request_ok },
+    { MOQT_MSG_SUBSCRIBE_NAMESPACE, "SUBSCRIBE_NAMESPACE",
+      moqt_draft18_decode_namespace_request },
+    { MOQT_MSG_SUBSCRIBE_TRACKS, "SUBSCRIBE_TRACKS",
+      moqt_draft18_decode_namespace_request },
+    { MOQT_MSG_SETUP, "SETUP", moqt_draft18_decode_setup },
+};
+
+/*
+ * Draft 19: PUBLISH_OK is reserved (PUBLISH is answered with REQUEST_OK),
+ * GOAWAY lost its Request ID and 0x0f is PUBLISH_SKIPPED; FETCH keeps the
+ * draft-18 Fetch Type until draft 20.
+ */
+static const moqt_message_descriptor_t moqt_draft19_messages[] = {
+    { MOQT_MSG_REQUEST_UPDATE, "REQUEST_UPDATE",
+      moqt_draft18_decode_request_update },
+    { MOQT_MSG_SUBSCRIBE, "SUBSCRIBE", moqt_draft18_decode_track_request },
+    { MOQT_MSG_SUBSCRIBE_OK, "SUBSCRIBE_OK", moqt_draft18_decode_subscribe_ok },
+    { MOQT_MSG_REQUEST_ERROR, "REQUEST_ERROR",
+      moqt_draft18_decode_request_error },
+    { MOQT_MSG_PUBLISH_NAMESPACE, "PUBLISH_NAMESPACE",
+      moqt_draft18_decode_publish_namespace },
+    { MOQT_MSG_REQUEST_OK, "REQUEST_OK", moqt_draft18_decode_request_ok },
+    { MOQT_MSG_NAMESPACE, "NAMESPACE", moqt_draft18_decode_namespace_suffix },
+    { MOQT_MSG_PUBLISH_DONE, "PUBLISH_DONE", moqt_draft18_decode_publish_done },
+    { MOQT_MSG_TRACK_STATUS, "TRACK_STATUS", moqt_draft18_decode_track_request },
+    { MOQT_MSG_NAMESPACE_DONE, "NAMESPACE_DONE",
+      moqt_draft18_decode_namespace_suffix },
+    { MOQT_MSG_PUBLISH_BLOCKED, "PUBLISH_SKIPPED",
+      moqt_draft18_decode_publish_blocked },
+    { MOQT_MSG_GOAWAY, "GOAWAY", moqt_draft22_decode_goaway },
+    { MOQT_MSG_FETCH, "FETCH", moqt_draft18_decode_fetch },
+    { MOQT_MSG_FETCH_OK, "FETCH_OK", moqt_draft18_decode_fetch_ok },
+    { MOQT_MSG_PUBLISH, "PUBLISH", moqt_draft18_decode_publish },
     { MOQT_MSG_SUBSCRIBE_NAMESPACE, "SUBSCRIBE_NAMESPACE",
       moqt_draft18_decode_namespace_request },
     { MOQT_MSG_SUBSCRIBE_TRACKS, "SUBSCRIBE_TRACKS",
@@ -3011,7 +3159,68 @@ static const moqt_draft_t moqt_draft18 = {
     .parse_datagram = moqt_draft18_parse_datagram,
 };
 
-/* Draft 22 keeps the draft-18 integers, stream layouts and datagrams. */
+/* Drafts 19 to 22 keep the draft-18 integers, stream layouts and datagrams. */
+static const moqt_draft_t moqt_draft19 = {
+    .version = 19,
+    .alpn = MOQT_ALPN_DRAFT_19,
+    .messages = moqt_draft19_messages,
+    .message_count = array_length(moqt_draft19_messages),
+    .parameters = moqt_draft19_parameters,
+    .parameter_count = array_length(moqt_draft19_parameters),
+    .setup_options = moqt_draft22_setup_option_type_vals,
+    .properties = moqt_draft22_property_type_vals,
+    .request_errors = moqt_draft19_request_error_vals,
+    .publish_done_codes = moqt_draft18_publish_done_vals,
+    .fetch_end_of_range = moqt_draft18_fetch_end_vals,
+    .dissector_name = MOQT_ALPN_DRAFT_19,
+    .datagram_dissector_name = MOQT_ALPN_DRAFT_19 ".datagram",
+    .streams = moqt_draft18_streams,
+    .classify_stream = moqt_draft18_classify_stream,
+    .read_integer = moqt_draft18_read_integer,
+    .parse_datagram = moqt_draft18_parse_datagram,
+};
+
+/*
+ * Draft 20 differs from draft 22 only in LOCATION_FILTER, so it takes every
+ * other descriptor from the later draft. Its registries are those of draft 22.
+ */
+static const moqt_draft_t moqt_draft20 = {
+    .version = 20,
+    .base = &moqt_draft22,
+    .alpn = MOQT_ALPN_DRAFT_20,
+    .parameters = moqt_draft20_parameters,
+    .parameter_count = array_length(moqt_draft20_parameters),
+    .setup_options = moqt_draft22_setup_option_type_vals,
+    .properties = moqt_draft22_property_type_vals,
+    .request_errors = moqt_draft22_request_error_vals,
+    .publish_done_codes = moqt_draft22_publish_done_vals,
+    .fetch_end_of_range = moqt_draft22_fetch_end_vals,
+    .dissector_name = MOQT_ALPN_DRAFT_20,
+    .datagram_dissector_name = MOQT_ALPN_DRAFT_20 ".datagram",
+    .streams = moqt_draft18_streams,
+    .classify_stream = moqt_draft18_classify_stream,
+    .read_integer = moqt_draft18_read_integer,
+    .parse_datagram = moqt_draft18_parse_datagram,
+};
+
+/* Draft 21 is an editorial restructure of draft 20. */
+static const moqt_draft_t moqt_draft21 = {
+    .version = 21,
+    .base = &moqt_draft20,
+    .alpn = MOQT_ALPN_DRAFT_21,
+    .setup_options = moqt_draft22_setup_option_type_vals,
+    .properties = moqt_draft22_property_type_vals,
+    .request_errors = moqt_draft22_request_error_vals,
+    .publish_done_codes = moqt_draft22_publish_done_vals,
+    .fetch_end_of_range = moqt_draft22_fetch_end_vals,
+    .dissector_name = MOQT_ALPN_DRAFT_21,
+    .datagram_dissector_name = MOQT_ALPN_DRAFT_21 ".datagram",
+    .streams = moqt_draft18_streams,
+    .classify_stream = moqt_draft18_classify_stream,
+    .read_integer = moqt_draft18_read_integer,
+    .parse_datagram = moqt_draft18_parse_datagram,
+};
+
 static const moqt_draft_t moqt_draft22 = {
     .version = 22,
     .alpn = MOQT_ALPN_DRAFT_22,
