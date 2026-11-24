@@ -70,6 +70,8 @@ static dissector_handle_t http3_capsule_handle;
  */
 static dissector_table_t http3_wt_protocol_table;
 static dissector_table_t http3_wt_protocol_datagram_table;
+/* HTTP Datagrams of other extended CONNECT protocols, such as MASQUE. */
+static dissector_table_t http3_connect_datagram_table;
 
 static int http3_follow_tap;
 
@@ -310,6 +312,8 @@ static const fragment_items http3_body_fragment_items = {
 #define HTTP3_HEADER_NAME_SCHEME            ":scheme"
 #define HTTP3_HEADER_NAME_STATUS            ":status"
 #define HTTP3_HEADER_NAME_CAPSULE_PROTOCOL  "capsule-protocol"
+/* draft-ietf-masque-connect-udp-listen, Section 2. */
+#define HTTP3_HEADER_NAME_CONNECT_UDP_BIND  "connect-udp-bind"
 /* draft-ietf-webtrans-http3-16 and later, Section 3.3. */
 #define HTTP3_HEADER_NAME_WT_AVAILABLE      "wt-available-protocols"
 #define HTTP3_HEADER_NAME_WT_PROTOCOL       "wt-protocol"
@@ -507,6 +511,8 @@ typedef struct _http3_stream_info {
     http3_pseudo_header_fields_t pseudo_headers;
     /* Extended CONNECT streams. */
     bool                 capsule_protocol;     /**< Message content is a sequence of capsules */
+    bool                 connect_udp_bind;     /**< Connect-UDP-Bind: ?1 */
+    void                *connect_state;        /**< State of the extended CONNECT protocol */
     const char          *wt_protocol;          /**< Negotiated WT-Protocol */
     const char          *wt_offered;           /**< First WT-Available-Protocols entry */
     unsigned             wt_offered_count;
@@ -1261,6 +1267,8 @@ populate_http3_header_tracking(packet_info *pinfo _U_, http3_stream_info_t *http
     } else if (strcmp(header_name, HTTP3_HEADER_NAME_CAPSULE_PROTOCOL) == 0) {
         /* RFC 9297, Section 3.4: a Structured Fields Boolean. */
         http3_stream->capsule_protocol = strcmp(header_value, "?1") == 0;
+    } else if (strcmp(header_name, HTTP3_HEADER_NAME_CONNECT_UDP_BIND) == 0) {
+        http3_stream->connect_udp_bind = strcmp(header_value, "?1") == 0;
     } else if (strcmp(header_name, HTTP3_HEADER_NAME_WT_PROTOCOL) == 0) {
         unsigned count;
 
@@ -2238,20 +2246,35 @@ http3_wt_session_protocol(const http3_stream_info_t *session)
     return session->wt_offered_count == 1 ? session->wt_offered : NULL;
 }
 
+/* What the protocol of an extended CONNECT request needs to know about it. */
+static void
+http3_fill_capsule_info(http_capsule_info_t *info, http3_stream_info_t *request, bool from_server)
+{
+    *info = (http_capsule_info_t){
+        .protocol = request->protocol,
+        .path = request->pseudo_headers.path,
+        .connect_udp_bind = request->connect_udp_bind,
+        .request_state = &request->connect_state,
+        .from_server = from_server,
+    };
+}
+
 static void
 http3_dissect_capsules(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
                        quic_stream_info *stream_info, http3_stream_info_t *http3_stream)
 {
-    http_capsule_info_t info = {
-        .protocol = http3_stream->protocol,
-        .from_server = stream_info->from_server,
-    };
+    http_capsule_info_t info;
     const char *wt_protocol = http3_wt_session_protocol(http3_stream);
 
+    http3_fill_capsule_info(&info, http3_stream, stream_info->from_server);
     /* A DATAGRAM capsule carries what an HTTP Datagram would (RFC 9297). */
     if (wt_protocol) {
         info.datagram_handle = dissector_get_string_handle(http3_wt_protocol_datagram_table,
                                                            wt_protocol);
+    } else if (http3_stream->protocol) {
+        info.datagram_handle = dissector_get_string_handle(http3_connect_datagram_table,
+                                                           http3_stream->protocol);
+        info.datagram_data = &info;
     }
     call_dissector_with_data(http3_capsule_handle, tvb, pinfo, tree, &info);
 }
@@ -3536,6 +3559,15 @@ dissect_http3_datagram(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void
                                            payload_tvb, pinfo, tree, true, datagram_info)) {
             return tvb_captured_length(tvb);
         }
+    } else if (request && request->protocol) {
+        /* An extended CONNECT protocol such as connect-udp (RFC 9298). */
+        http_capsule_info_t info;
+
+        http3_fill_capsule_info(&info, request, datagram_info->from_server);
+        if (dissector_try_string_with_data(http3_connect_datagram_table, request->protocol,
+                                           payload_tvb, pinfo, tree, true, &info)) {
+            return tvb_captured_length(tvb);
+        }
     }
     proto_tree_add_item(datragram_tree, hf_http3_datagram_payload, tvb, offset, -1, ENC_NA);
 
@@ -4359,6 +4391,7 @@ proto_reg_handoff_http3(void)
 #endif
 
     http3_capsule_handle = find_dissector_add_dependency("capsule", proto_http3);
+    http3_connect_datagram_table = find_dissector_table("http.connect.datagram");
 
     dissector_add_string("quic.proto", "h3", http3_handle);
     dissector_add_string("quic.proto.datagram", "h3", http3_datagram_handle);

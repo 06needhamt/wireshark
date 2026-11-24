@@ -20,6 +20,15 @@
 typedef struct _http_capsule_info {
     /* The upgrade token of the extended CONNECT request (":protocol"), if any. */
     const char         *protocol;
+    /* The request's ":path", which carries the target of a MASQUE request. */
+    const char         *path;
+    /* Request header fields that change how the protocol is used. */
+    bool                connect_udp_bind;   /* Connect-UDP-Bind: ?1 */
+    /*
+     * Storage for the protocol's state of this request, kept by the HTTP
+     * dissector for the lifetime of the capture (NULL until first set).
+     */
+    void              **request_state;
     /*
      * Dissects the payload of a DATAGRAM capsule (RFC 9297, Section 3.5), the
      * same as the payload of an HTTP Datagram on this request stream. NULL
@@ -29,5 +38,11 @@ typedef struct _http_capsule_info {
     void               *datagram_data;
     bool                from_server;
 } http_capsule_info_t;
+
+/*
+ * The "http.connect.datagram" dissector table, keyed by the upgrade token of
+ * an extended CONNECT request, dissects that request's HTTP Datagram payloads
+ * (and DATAGRAM capsules). The data argument is an http_capsule_info_t.
+ */
 
 #endif /* __PACKET_HTTP_CAPSULE_H__ */

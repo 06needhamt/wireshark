@@ -3432,6 +3432,95 @@ class TestDissectWebTransport:
 
 
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
+class TestDissectMasque:
+    '''
+    MASQUE over HTTP/3, generated with tools/generate-masque-capture.py:
+    connect-udp, bound connect-udp, connect-ip and connect-ethernet requests
+    with their capsules and HTTP Datagrams.
+    '''
+    @staticmethod
+    def _fields(cmd_tshark, capture_file, test_env, pass_args, display_filter, *fields,
+                extra=()):
+        command = [cmd_tshark, *pass_args, *extra, '-r', capture_file('masque.pcapng.gz'),
+                   '-Y', display_filter, '-T', 'fields']
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_masque_connect_udp(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''The target comes from the URI template; with the preference set,
+        payloads in datagrams and DATAGRAM capsules go to the port's dissector.'''
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'masque.target.host', 'masque.target.host',
+                            'masque.target.port') == [
+            ['192.0.2.53', '53'], ['192.0.2.53', '53'],
+            ['%2A', '']]       # the bound request's wildcard target
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args, 'dns',
+                            'dns.qry.name', 'dns.a') == []
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args, 'dns',
+                            'dns.qry.name', 'dns.a',
+                            extra=('-o', 'masque.try_udp_port:TRUE')) == [
+            ['www.example', ''], ['www.example', '192.0.2.80']]
+
+    def test_masque_bound_udp(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Compression contexts registered by capsules decode later datagrams.'''
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'capsule.type == 0x11', 'masque.context_id',
+                            'masque.ip.version', 'masque.ip.addr', 'masque.udp.port') == [
+            ['2,4', '0,4', '198.51.100.7', '4000']]
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'http3.datagram && masque.udp.port == 5000',
+                            'masque.context_id', 'masque.ip.addr', 'masque.udp.port') == [
+            # One packet holds all four datagrams.
+            ['2,4,0,6', '203.0.113.9,198.51.100.7', '5000,4000']]
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'masque.context_id.zero || masque.context_id.unknown',
+                            'masque.context_id') == [['2,4,0,6']]
+
+    def test_masque_connect_ip(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Address, route and DNS configuration capsules, and an IP packet.'''
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'capsule.type == 0x01', 'masque.request_id', 'masque.ip.addr6',
+                            'masque.ip.prefix_length', 'masque.route.start',
+                            'masque.route.end', 'masque.route.ip_protocol',
+                            'masque.dns.auth_domain', 'masque.dns.internal_domain',
+                            'masque.dns.search_domain', 'masque.pref64.prefix_length') == [
+            ['1,2', '2001:db8::10', '32,128', '0.0.0.0', '255.255.255.255', '0',
+             'dns.example', 'corp.example', 'example', '96']]
+        # The outer IP header of the QUIC packet comes first.
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args, 'icmp',
+                            'ip.src', 'ip.dst', 'icmp.type') == [
+            ['192.0.2.1,192.0.2.10', '192.0.2.2,198.51.100.1', '8']]
+
+    def test_masque_connect_ethernet(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Context ID 0 of connect-ethernet carries an Ethernet frame.'''
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args, 'arp',
+                            'arp.src.proto_ipv4', 'arp.dst.proto_ipv4') == [
+            ['192.0.2.10', '192.0.2.1']]
+
+    def test_masque_quic_proxy(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''QUIC-aware proxying capsules of drafts 09 and 10.'''
+        assert self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'masque.qp.sequence || masque.qp.max_ids', '_ws.col.info',
+                            'masque.qp.sequence', 'masque.qp.cid', 'masque.qp.max_ids') == [
+            ['DATA, REGISTER_CLIENT_CID', '0', 'c1c2c3c4', ''],
+            ['DATA, ACK_CLIENT_CID, MAX_CONNECTION_IDS', '0', '', '4']]
+
+    def test_masque_expert(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Only the misuse of Context ID 0 is a problem.'''
+        stdout = subprocess.check_output((cmd_tshark, *pass_args,
+                '-r', capture_file('masque.pcapng.gz'), '-q', '-zexpert,warn',
+            ), encoding='utf-8', env=test_env)
+        # The second pass also notes that the proxied ping got no reply.
+        rows = [line for line in stdout.splitlines()
+                if ' MASQUE ' in line or ' Capsule ' in line or ' HTTP3 ' in line]
+        assert len(rows) == 1
+        assert 'Context ID 0 cannot be used on a wildcard' in rows[0]
+        assert not grep_output(stdout, 'Errors')
+
+
+@pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
 class TestDissectMoqLite06:
     '''
     moq-lite-06 over QUIC, generated with tools/generate-moq-lite-06-capture.py.

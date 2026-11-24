@@ -1214,6 +1214,7 @@ set(DISSECTOR_SRC
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-m2ua.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-m3ua.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-maap.c
+	${CMAKE_CURRENT_SOURCE_DIR}/packet-masque.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-mac-lte-framed.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-mac-lte.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-mac-nr.c

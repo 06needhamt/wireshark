@@ -90,13 +90,37 @@ static const val64_string capsule_type_vals[] = {
     { 0x11,                            "COMPRESSION_ASSIGN" },
     { 0x12,                            "COMPRESSION_ACK" },
     { 0x13,                            "COMPRESSION_CLOSE" },
-    /* draft-ietf-masque-quic-proxy. */
-    { 0xffe600,                        "REGISTER_CLIENT_CID" },
-    { 0xffe601,                        "REGISTER_TARGET_CID" },
-    { 0xffe602,                        "ACK_CLIENT_CID" },
-    { 0xffe603,                        "ACK_TARGET_CID" },
-    { 0xffe604,                        "CLOSE_CLIENT_CID" },
-    { 0xffe605,                        "CLOSE_TARGET_CID" },
+    /* draft-ietf-masque-connect-ip-dns-07 (provisional). */
+    { 0x1ace79ec,                      "DNS_ASSIGN" },
+    { 0x274c0fbc,                      "PREF64" },
+    /* draft-ietf-masque-quic-proxy-09 (provisional). */
+    { 0xffe800,                        "REGISTER_CLIENT_CID" },
+    { 0xffe801,                        "REGISTER_TARGET_CID" },
+    { 0xffe802,                        "ACK_CLIENT_CID" },
+    { 0xffe803,                        "ACK_CLIENT_VCID" },
+    { 0xffe804,                        "ACK_TARGET_CID" },
+    { 0xffe805,                        "REJECT_CLIENT_CID" },
+    { 0xffe806,                        "REJECT_TARGET_CID" },
+    { 0xffe807,                        "CLOSE_CLIENT_CID" },
+    { 0xffe808,                        "CLOSE_TARGET_CID" },
+    { 0xffe809,                        "MAX_CONNECTION_IDS" },
+    /* draft-ietf-masque-quic-proxy-10 (provisional). */
+    { 0xffe900,                        "REGISTER_CLIENT_CID" },
+    { 0xffe901,                        "REGISTER_TARGET_CID" },
+    { 0xffe902,                        "ACK_CLIENT_CID" },
+    { 0xffe903,                        "ACK_TARGET_CID" },
+    { 0xffe904,                        "REJECT_CLIENT_CID" },
+    { 0xffe905,                        "REJECT_TARGET_CID" },
+    { 0xffe906,                        "RETIRE_CLIENT_CID" },
+    { 0xffe907,                        "RETIRE_TARGET_CID" },
+    { 0xffe908,                        "MAX_CLIENT_CIDS" },
+    { 0xffe909,                        "MAX_TARGET_CIDS" },
+    { 0xffe90a,                        "NEW_TARGET_VCID" },
+    { 0xffe90b,                        "NEW_CLIENT_VCID" },
+    { 0xffe90c,                        "ACK_CLIENT_VCID" },
+    { 0xffe90d,                        "REJECT_CLIENT_VCID" },
+    { 0xffe90e,                        "RETIRE_TARGET_VCID" },
+    { 0xffe90f,                        "RETIRE_CLIENT_VCID" },
     /* draft-ietf-webtrans-http3. */
     { CAPSULE_WT_CLOSE_SESSION,        "WT_CLOSE_SESSION" },
     { CAPSULE_WT_DRAIN_SESSION,        "WT_DRAIN_SESSION" },
@@ -347,6 +371,9 @@ proto_register_http_capsule(void)
     register_dissector("capsule", dissect_http_capsules, proto_http_capsule);
     capsule_type_table = register_dissector_table("capsule.type", "HTTP Capsule Type",
                                                   proto_http_capsule, FT_UINT32, BASE_HEX);
+    register_dissector_table("http.connect.datagram",
+                             "HTTP Datagrams of an extended CONNECT protocol",
+                             proto_http_capsule, FT_STRING, STRING_CASE_SENSITIVE);
 }
 
 /*
