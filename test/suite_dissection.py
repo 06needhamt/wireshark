@@ -3442,6 +3442,76 @@ class TestDissectMoqLoc:
 
 
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
+class TestDissectMoqMsf:
+    '''
+    MSF over MOQT draft 23, generated with tools/generate-moq-msf-capture.py:
+    a catalog, one Object on each of its tracks, then a GZIP-compressed delta
+    catalog that adds "audio2", clones "video" as "video-low" and removes "ts".
+    '''
+    @staticmethod
+    def _fields(cmd_tshark, capture_file, test_env, pass_args, display_filter, *fields):
+        command = [cmd_tshark, *pass_args, '-r', capture_file('moq-msf.pcapng.gz'),
+                   '-Y', display_filter, '-T', 'fields', '-E', 'occurrence=a']
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_moq_msf_catalogs(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''The full catalog and the decompressed delta catalog.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moqt.object.track_name == "catalog"',
+                            'moq_msf.version', 'moq_msf.delta', 'moq_msf.delta.op',
+                            'moq_msf.track', 'moq_msf.compression', 'json.object')
+        assert [row[:5] for row in rows] == [
+            ['draft-02', 'False', '',
+             'video,audio,video-cmaf,ts,timeline,sap', ''],
+            ['', 'True', 'add,clone,remove', 'audio2,video-low,ts', '1'],
+        ]
+        # The JSON dissector sees the decompressed catalog too.
+        assert all(row[5] for row in rows)
+
+    def test_moq_msf_routing(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Each Object is routed by its track's packaging.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moq_msf && !(moqt.object.track_name == "catalog")',
+                            'moqt.object.track_name', 'moq_msf.packaging',
+                            'moq_loc.codec', 'frame.protocols')
+        routed = {row[0]: (row[1], row[2], row[3].split(':')) for row in rows}
+        assert routed['video'][:2] == ('loc', 'avc1.42000a')
+        assert 'h264' in routed['video'][2]
+        assert routed['audio'][:2] == ('loc', 'opus') and 'opus' in routed['audio'][2]
+        assert routed['video-cmaf'][0] == 'cmaf' and 'mp4' in routed['video-cmaf'][2]
+        assert routed['ts'][0] == 'mpeg2ts' and 'mp2t' in routed['ts'][2]
+        assert routed['timeline'][0] == 'mediatimeline' and 'json' in routed['timeline'][2]
+        assert routed['sap'][0] == 'eventtimeline' and 'json' in routed['sap'][2]
+        # Tracks from the delta catalog; the clone inherits the packaging.
+        assert routed['audio2'][:2] == ('loc', 'opus')
+        assert routed['video-low'][:2] == ('loc', 'avc1.42000b')
+        assert len(rows) == 8
+
+    def test_moq_msf_removed_track(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''After the delta removes "ts", its Objects are no longer MSF.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moqt.object.track_name == "ts"', 'moq_msf.packaging')
+        assert rows == [['mpeg2ts'], ['']]
+
+    def test_moq_msf_timeline(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Media timeline records are counted; event timelines keep their type.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moqt.object.track_name == "timeline" || moqt.object.track_name == "sap"',
+                            'moq_msf.timeline.records', 'moq_msf.event_type')
+        assert rows == [['2', ''], ['', 'org.ietf.moq.cmsf.sap']]
+
+    def test_moq_msf_no_errors(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Nothing is malformed or reported as an error.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            '_ws.malformed || _ws.expert.severity >= error',
+                            'frame.number')
+        assert rows == []
+
+
+@pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
 class TestDissectWebTransport:
     '''
     WebTransport over HTTP/3, generated with tools/generate-webtransport-capture.py.

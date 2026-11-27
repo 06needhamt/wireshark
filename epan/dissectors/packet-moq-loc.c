@@ -572,35 +572,14 @@ loc_add_presentation_time(proto_tree *tree, tvbuff_t *tvb, uint64_t timestamp,
     proto_item_set_generated(item);
 }
 
-/*
- * "moqt.payload": an Object is LOC when it or its track has a LOC property
- * other than TIMESCALE, which is too generic to rely on.
- */
-static bool
-dissect_loc_moqt_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
-                      void *data)
+static void
+loc_dissect_moqt_object(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
+                        const moqt_object_info_t *info, const char *codec_hint)
 {
-    const moqt_object_info_t *info = (const moqt_object_info_t *)data;
-    static const uint64_t markers[] = {
-        LOC_PROP_VIDEO_FRAME_MARKING, LOC_PROP_AUDIO_LEVEL, LOC_PROP_VIDEO_CONFIG,
-        LOC_PROP_AUDIO_CONFIG, LOC_PROP_TIMESTAMP, LOC_PROP_CODEC_STRING,
-        LOC_PROP_CODEC_ID,
-    };
     const moqt_property_t *timestamp, *timescale, *codec, *config;
     proto_item *item, *loc_item;
     proto_tree *loc_tree;
     const char *codec_string;
-    bool found = false;
-
-    if (!info) {
-        return false;
-    }
-    for (unsigned i = 0; i < array_length(markers) && !found; i++) {
-        found = moqt_object_find_property(info, markers[i]) != NULL;
-    }
-    if (!found) {
-        return false;
-    }
 
     loc_item = proto_tree_add_item(tree, proto_moq_loc, tvb, 0, -1, ENC_NA);
     loc_tree = proto_item_add_subtree(loc_item, ett_loc);
@@ -610,6 +589,9 @@ dissect_loc_moqt_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
         codec = moqt_object_find_property(info, LOC_PROP_CODEC_ID);
     }
     codec_string = loc_property_string(pinfo->pool, codec);
+    if (!codec_string) {
+        codec_string = codec_hint;
+    }
     if (codec_string) {
         item = proto_tree_add_string(loc_tree, hf_loc_codec, tvb, 0, 0, codec_string);
         proto_item_set_generated(item);
@@ -624,6 +606,47 @@ dissect_loc_moqt_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
                         config && config->data
                             ? loc_config_nal_length_size(config->data, config->length)
                             : 0);
+}
+
+/* "moq_loc.object": a MOQT Object a streaming format says is LOC. */
+static int
+dissect_loc_object(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    const moq_loc_object_info_t *info = (const moq_loc_object_info_t *)data;
+
+    if (!info || !info->object) {
+        return 0;
+    }
+    loc_dissect_moqt_object(tvb, pinfo, tree, info->object, info->codec);
+    return tvb_captured_length(tvb);
+}
+
+/*
+ * "moqt.payload": an Object is LOC when it or its track has a LOC property
+ * other than TIMESCALE, which is too generic to rely on.
+ */
+static bool
+dissect_loc_moqt_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
+                      void *data)
+{
+    const moqt_object_info_t *info = (const moqt_object_info_t *)data;
+    static const uint64_t markers[] = {
+        LOC_PROP_VIDEO_FRAME_MARKING, LOC_PROP_AUDIO_LEVEL, LOC_PROP_VIDEO_CONFIG,
+        LOC_PROP_AUDIO_CONFIG, LOC_PROP_TIMESTAMP, LOC_PROP_CODEC_STRING,
+        LOC_PROP_CODEC_ID,
+    };
+    bool found = false;
+
+    if (!info) {
+        return false;
+    }
+    for (unsigned i = 0; i < array_length(markers) && !found; i++) {
+        found = moqt_object_find_property(info, markers[i]) != NULL;
+    }
+    if (!found) {
+        return false;
+    }
+    loc_dissect_moqt_object(tvb, pinfo, tree, info, NULL);
     return true;
 }
 
@@ -976,6 +999,9 @@ proto_register_moq_loc(void)
     loc_frame_handle = register_dissector_with_description(
         "moq_loc.frame", "LOC frame (property count, properties, payload)",
         dissect_loc_frame, proto_moq_loc);
+    register_dissector_with_description(
+        "moq_loc.object", "LOC MOQT Object (with a codec from a catalog)",
+        dissect_loc_object, proto_moq_loc);
 }
 
 void

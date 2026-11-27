@@ -21,4 +21,15 @@ typedef struct _moq_loc_frame_info {
     const char *codec;      /* WebCodecs codec string, or NULL. */
 } moq_loc_frame_info_t;
 
+/*
+ * "data" argument of the "moq_loc.object" dissector, for a MOQT Object a
+ * streaming format (MSF) knows is LOC. codec is the catalog's codec string;
+ * a Codec String property on the Object or track wins.
+ */
+struct _moqt_object_info;
+typedef struct _moq_loc_object_info {
+    const struct _moqt_object_info *object;
+    const char *codec;      /* WebCodecs codec string, or NULL. */
+} moq_loc_object_info_t;
+
 #endif /* __PACKET_MOQ_LOC_H__ */
