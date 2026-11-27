@@ -803,6 +803,9 @@ typedef struct {
 typedef struct {
     const char *track_namespace;
     const char *track_name;
+    moqt_bytes_t *namespace_fields;  /* file scope */
+    unsigned namespace_field_count;
+    moqt_bytes_t track_name_bytes;
     moqt_property_t *properties;     /* Track Properties, file scope */
     unsigned property_count;
 } moqt_track_t;
@@ -837,6 +840,8 @@ typedef struct {
     uint64_t track_alias;
     const char *track_namespace;
     const char *track_name;
+    wmem_array_t *namespace_fields;  /* of moqt_bytes_t, packet scope */
+    moqt_bytes_t track_name_bytes;
     moqt_property_list_t properties;
 } moqt_capture_t;
 
@@ -1365,6 +1370,8 @@ moqt_dissect_namespace(moqt_cursor_t *cursor, const char *label)
         text = wmem_strbuf_new(cursor->pinfo->pool, "");
         if (cursor->capture && strcmp(label, "Track Namespace") == 0) {
             raw = wmem_strbuf_new(cursor->pinfo->pool, "");
+            cursor->capture->namespace_fields =
+                wmem_array_new(cursor->pinfo->pool, sizeof(moqt_bytes_t));
         }
     }
     for (uint64_t i = 0; i < count && !nested.failed; i++) {
@@ -1380,6 +1387,13 @@ moqt_dissect_namespace(moqt_cursor_t *cursor, const char *label)
             moqt_append_name(text, cursor->tvb, nested.offset - (int)length,
                              (int)length);
             if (raw) {
+                moqt_bytes_t field = {
+                    .data = tvb_memdup(cursor->pinfo->pool, cursor->tvb,
+                                       nested.offset - (int)length, (int)length),
+                    .length = (unsigned)length,
+                };
+
+                wmem_array_append_one(cursor->capture->namespace_fields, field);
                 if (i != 0) {
                     wmem_strbuf_append_c(raw, '/');
                 }
@@ -1413,6 +1427,11 @@ moqt_dissect_track_name(moqt_cursor_t *cursor)
         cursor->capture->track_name = (const char *)tvb_get_string_enc(
             cursor->pinfo->pool, cursor->tvb, cursor->offset - (int)length,
             (int)length, ENC_UTF_8);
+        cursor->capture->track_name_bytes = (moqt_bytes_t){
+            .data = tvb_memdup(cursor->pinfo->pool, cursor->tvb,
+                               cursor->offset - (int)length, (int)length),
+            .length = (unsigned)length,
+        };
     }
 }
 
@@ -3098,6 +3117,25 @@ moqt_session_learn(moqt_cursor_t *cursor, const moqt_capture_t *capture)
         track->track_namespace = wmem_strdup(wmem_file_scope(),
                                              capture->track_namespace);
         track->track_name = wmem_strdup(wmem_file_scope(), capture->track_name);
+        track->track_name_bytes = (moqt_bytes_t){
+            .data = (const uint8_t *)wmem_memdup(wmem_file_scope(),
+                                                 capture->track_name_bytes.data,
+                                                 capture->track_name_bytes.length),
+            .length = capture->track_name_bytes.length,
+        };
+        if (capture->namespace_fields) {
+            track->namespace_field_count = wmem_array_get_count(capture->namespace_fields);
+            track->namespace_fields = wmem_alloc0_array(
+                wmem_file_scope(), moqt_bytes_t, MAX(track->namespace_field_count, 1));
+            for (unsigned i = 0; i < track->namespace_field_count; i++) {
+                const moqt_bytes_t *field = (const moqt_bytes_t *)wmem_array_index(
+                    capture->namespace_fields, i);
+
+                track->namespace_fields[i].length = field->length;
+                track->namespace_fields[i].data = (const uint8_t *)wmem_memdup(
+                    wmem_file_scope(), field->data, field->length);
+            }
+        }
         if (capture->request_id_set) {
             moqt_bind(session->by_request_id, capture->request_id, track, frame);
         }
@@ -3156,6 +3194,18 @@ moqt_track_by_request_id(packet_info *pinfo, uint64_t request_id)
 /* ------------------------------------------------------------------------- */
 
 static void
+moqt_object_info_fill_track(moqt_object_info_t *info, const moqt_track_t *track)
+{
+    info->track_namespace = track->track_namespace;
+    info->track_name = track->track_name;
+    info->namespace_fields = track->namespace_fields;
+    info->namespace_field_count = track->namespace_field_count;
+    info->track_name_bytes = track->track_name_bytes;
+    info->track_properties = track->properties;
+    info->track_property_count = track->property_count;
+}
+
+static void
 moqt_object_info_init(moqt_object_info_t *info, const moqt_cursor_t *cursor,
                       const moqt_stream_state_t *state)
 {
@@ -3176,13 +3226,12 @@ moqt_object_info_init(moqt_object_info_t *info, const moqt_cursor_t *cursor,
         info->group_id_known = true;
         info->subgroup_id = state->subgroup.subgroup_id;
         info->subgroup_id_known = state->subgroup.subgroup_id_known;
+        info->publisher_priority = state->header.publisher_priority;
+        info->publisher_priority_known = state->header.priority_present;
         track = moqt_track_by_alias(cursor->pinfo, info->track_alias);
     }
     if (track) {
-        info->track_namespace = track->track_namespace;
-        info->track_name = track->track_name;
-        info->track_properties = track->properties;
-        info->track_property_count = track->property_count;
+        moqt_object_info_fill_track(info, track);
     }
 }
 
@@ -3195,10 +3244,7 @@ moqt_object_info_set_track(moqt_object_info_t *info, packet_info *pinfo,
     info->track_alias = track_alias;
     info->track_alias_known = true;
     if (track) {
-        info->track_namespace = track->track_namespace;
-        info->track_name = track->track_name;
-        info->track_properties = track->properties;
-        info->track_property_count = track->property_count;
+        moqt_object_info_fill_track(info, track);
     }
 }
 
@@ -4297,7 +4343,8 @@ moqt_add_datagram_type_flags(moqt_cursor_t *cursor, int length, uint64_t type)
 /* The rest of an OBJECT_DATAGRAM is the payload of a Normal Object. */
 static void
 moqt_dissect_datagram_payload(moqt_cursor_t *cursor, uint64_t track_alias,
-                              uint64_t group_id, uint64_t object_id)
+                              uint64_t group_id, uint64_t object_id,
+                              const uint8_t *publisher_priority)
 {
     moqt_object_info_t info = {
         .draft = cursor->draft->version,
@@ -4306,6 +4353,8 @@ moqt_dissect_datagram_payload(moqt_cursor_t *cursor, uint64_t track_alias,
         .object_id = object_id,
         .object_id_known = true,
         .datagram = true,
+        .publisher_priority = publisher_priority ? *publisher_priority : 0,
+        .publisher_priority_known = publisher_priority != NULL,
     };
 
     if (cursor->offset >= cursor->end) {
@@ -4322,6 +4371,7 @@ moqt_draft18_parse_datagram_object(moqt_cursor_t *cursor, uint64_t type)
     uint64_t properties_length = 0;
     uint64_t status = MOQT_OBJECT_NORMAL;
     uint64_t track_alias = 0, group_id = 0, object_id = 0;
+    uint8_t priority = 0;
     moqt_property_list_t properties = { .scope = cursor->pinfo->pool };
     int properties_offset;
     int status_offset;
@@ -4336,7 +4386,7 @@ moqt_draft18_parse_datagram_object(moqt_cursor_t *cursor, uint64_t type)
         moqt_add_generated_uint64(cursor, hf_moqt_object_id, 0);
     }
     if ((type & MOQT_DATAGRAM_DEFAULT_PRIORITY) == 0) {
-        moqt_cursor_uint8(cursor, hf_moqt_publisher_priority, NULL,
+        moqt_cursor_uint8(cursor, hf_moqt_publisher_priority, &priority,
                           "publisher priority");
     }
     if ((type & MOQT_DATAGRAM_PROPERTIES) != 0) {
@@ -4373,7 +4423,9 @@ moqt_draft18_parse_datagram_object(moqt_cursor_t *cursor, uint64_t type)
     } else {
         col_append_fstr(cursor->pinfo->cinfo, COL_INFO, "%d bytes)",
                         cursor->end - cursor->offset);
-        moqt_dissect_datagram_payload(cursor, track_alias, group_id, object_id);
+        moqt_dissect_datagram_payload(
+            cursor, track_alias, group_id, object_id,
+            (type & MOQT_DATAGRAM_DEFAULT_PRIORITY) == 0 ? &priority : NULL);
     }
 }
 
@@ -4418,6 +4470,7 @@ moqt_draft16_parse_datagram(moqt_cursor_t *cursor)
 {
     uint64_t track_alias = 0, group_id = 0, object_id = 0;
     uint64_t status = MOQT_OBJECT_NORMAL;
+    uint8_t priority = 0;
     moqt_property_list_t properties = { .scope = cursor->pinfo->pool };
     int status_offset;
 
@@ -4426,7 +4479,7 @@ moqt_draft16_parse_datagram(moqt_cursor_t *cursor)
     moqt_cursor_varint(cursor, hf_moqt_track_alias, &track_alias, "track alias");
     moqt_cursor_varint(cursor, hf_moqt_group_id, &group_id, "group ID");
     moqt_cursor_varint(cursor, hf_moqt_object_id, &object_id, "object ID");
-    moqt_cursor_uint8(cursor, hf_moqt_publisher_priority, NULL,
+    moqt_cursor_uint8(cursor, hf_moqt_publisher_priority, &priority,
                       "publisher priority");
     moqt_draft16_dissect_counted_kv_pairs(cursor, MOQT_KV_PROPERTY,
                                           hf_moqt_extension_count,
@@ -4452,7 +4505,8 @@ moqt_draft16_parse_datagram(moqt_cursor_t *cursor)
     } else {
         col_append_fstr(cursor->pinfo->cinfo, COL_INFO, "%d bytes)",
                         cursor->end - cursor->offset);
-        moqt_dissect_datagram_payload(cursor, track_alias, group_id, object_id);
+        moqt_dissect_datagram_payload(cursor, track_alias, group_id, object_id,
+                                      &priority);
     }
 }
 

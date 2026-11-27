@@ -3695,6 +3695,68 @@ class TestDissectSFrame:
 
 
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
+class TestDissectMoqSecureObjects:
+    '''
+    MOQ Secure Objects over MOQT draft 23, generated with
+    tools/generate-moq-secobj-capture.py, whose encryption is checked against
+    the draft's Appendix B.4 vectors. Keys are given for three of the four
+    tracks; the "audio" plaintext is a LOC Opus frame.
+    '''
+    KEYS = (
+        '"","video","7","4",7369787465656e2062797465206b6579',
+        '"example.com/meeting-123","audio","9","1",617564696f20747261636b206b657921',
+        '"","","11","5",612033322d627974652062617365206b657920666f7220736c69646573212121',
+    )
+
+    def _fields(self, cmd_tshark, capture_file, test_env, pass_args, keys,
+                display_filter, *fields):
+        command = [cmd_tshark, *pass_args, '-r', capture_file('moq-secobj.pcapng.gz'),
+                   '-Y', display_filter, '-T', 'fields', '-E', 'occurrence=a']
+        for key in keys:
+            command.extend(('-o', f'uat:moq_secobj_keys:{key}'))
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_moq_secobj_decryption(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''GCM (suites 4 and 5) and CTR+HMAC (suite 1) Objects decrypt.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, self.KEYS,
+                            'moq_secobj', 'moqt.object.track_name', 'moq_secobj.key_id',
+                            'moq_secobj.cipher_suite', 'moq_secobj.aad.priority',
+                            'moq_secobj.payload')
+        assert rows == [
+            ['video', '7', '0x0004', '128', b'hello from moq'.hex()],
+            ['audio', '9', '0x0001', '64', 'fc' + '77' * 20],
+            ['chat', '99', '', '', ''],
+            ['slides', '11', '0x0005', '200', b'slide2'.hex()],
+        ]
+
+    def test_moq_secobj_plaintext(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''The Encrypted Properties List and Padding, and the inner LOC Opus frame.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, self.KEYS,
+                            'moq_secobj.payload', 'moqt.object.track_name',
+                            'moq_secobj.epl.properties', 'moq_secobj.padding.length',
+                            'moq_loc.codec', 'opus')
+        assert rows == [
+            ['video', '010203', '4', '', ''],
+            ['audio', '', '', 'opus', 'opus'],
+            ['slides', '', '', '', ''],
+        ]
+
+    def test_moq_secobj_without_keys(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Without keys every Object is ciphertext with a note; a wrong key fails.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, (),
+                            'moq_secobj', 'moq_secobj.key_id', '_ws.expert.message')
+        assert [row[0] for row in rows] == ['7', '9', '99', '11']
+        assert all('No key for this Key ID' in row[1] for row in rows)
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            ('"","video","7","4",00112233445566778899aabbccddeeff',),
+                            'moq_secobj.key_id == 7', '_ws.expert.message')
+        assert len(rows) == 1 and 'Decryption failed' in rows[0][0]
+
+
+@pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
 class TestDissectWebTransport:
     '''
     WebTransport over HTTP/3, generated with tools/generate-webtransport-capture.py.

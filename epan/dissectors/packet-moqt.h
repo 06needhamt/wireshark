@@ -27,6 +27,12 @@ typedef struct _moqt_property {
     unsigned       length;      /* Odd types only. */
 } moqt_property_t;
 
+/* A byte string; valid for as long as the structure that holds it. */
+typedef struct _moqt_bytes {
+    const uint8_t *data;
+    unsigned       length;
+} moqt_bytes_t;
+
 /*
  * Passed as the "data" argument to dissectors registered in the
  * "moqt.property" table, which is keyed by Property type. The tvb holds the
@@ -50,6 +56,10 @@ typedef struct _moqt_object_info {
     unsigned    draft;
     const char *track_namespace;
     const char *track_name;
+    /* The same, as the bytes on the wire (for Secure Objects' Full Track Name). */
+    const moqt_bytes_t *namespace_fields;
+    unsigned    namespace_field_count;
+    moqt_bytes_t track_name_bytes;
 
     uint64_t    track_alias;
     bool        track_alias_known;  /* false on FETCH streams */
@@ -62,6 +72,8 @@ typedef struct _moqt_object_info {
     bool        subgroup_id_known;
     uint64_t    object_id;
     bool        object_id_known;
+    uint8_t     publisher_priority;
+    bool        publisher_priority_known;  /* false when the track default applies */
     bool        datagram;
 
     /* Properties of this Object, in wire order. */
