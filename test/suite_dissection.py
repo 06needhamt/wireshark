@@ -3512,6 +3512,45 @@ class TestDissectMoqMsf:
 
 
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
+class TestDissectMoqLocmaf:
+    '''
+    LOCMAF in an MSF broadcast, generated with
+    tools/generate-moq-locmaf-capture.py: a full header Object with a genBox,
+    a delta header Object and a rawBoxes Object.
+    '''
+    @staticmethod
+    def _fields(cmd_tshark, capture_file, test_env, pass_args, display_filter, *fields):
+        command = [cmd_tshark, *pass_args, '-r', capture_file('moq-locmaf.pcapng.gz'),
+                   '-Y', display_filter, '-T', 'fields', '-E', 'occurrence=a']
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_moq_locmaf_elements(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''The three Objects' elements, reached through the MSF catalog.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moq_locmaf',
+                            'moq_msf.packaging', 'moq_locmaf.element_type',
+                            'moq_locmaf.genbox.type', 'mp4.box.type_str')
+        assert rows == [['locmaf,locmaf,locmaf', '1,2,3,4', 'styp', 'moof,mfhd,mdat']]
+
+    def test_moq_locmaf_fields(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Scalars, lists, signed offsets, deltas and deleted fields.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moq_locmaf',
+                            'moq_locmaf.field.id', 'moq_locmaf.field.value',
+                            'moq_locmaf.field.entry', 'moq_locmaf.field.signed',
+                            'moq_locmaf.field.deleted')
+        assert rows == [['1,4,5,7,10,14,14,27', '3000,0,3,1',
+                         '100,80,33554432,16842752,16842752', '0,-3000,3000,-1', '7']]
+
+    def test_moq_locmaf_no_errors(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Nothing is malformed or reported as an error.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            '_ws.malformed || _ws.expert.severity >= error', 'frame.number')
+        assert rows == []
+
+
+@pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
 class TestDissectWebTransport:
     '''
     WebTransport over HTTP/3, generated with tools/generate-webtransport-capture.py.
