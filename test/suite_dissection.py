@@ -3098,8 +3098,9 @@ class TestDissectMoqt:
             assert self._field_rows(
                 cmd_tshark, capture_path, test_env, 'moqt.object.payload',
                 ('moqt.object.track_namespace', 'moqt.object.track_name',
-                 'moqt.property.integer'),
-                extra_args=pass_args) == [['live/room1', 'audio', '133']]
+                 'moq_loc.codec', 'moq_loc.audio_level.dbov'),
+                extra_args=pass_args) == [['live/room1', 'audio', 'opus', '5']]
+        assert self._matching_frames(cmd_tshark, capture_path, test_env, 'opus') == ['3']
 
     def test_moqt_draft16_data(
             self, cmd_text2pcap, cmd_tshark, result_file,
@@ -3368,6 +3369,76 @@ class TestDissectMoqLite:
         assert not grep_output(stdout, 'Errors')
         assert count_output(stdout, 'Unknown bidirectional stream type') == 1
         assert 'Warns (1)' in stdout
+
+
+@pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
+class TestDissectMoqLoc:
+    '''
+    LOC, generated with tools/generate-moq-loc-capture.py. Connection 1 is
+    MOQT draft 23 with H.264 video on a subgroup stream and Opus audio in
+    datagrams; connection 2 is a hang broadcast over moq-lite-05 whose video
+    rendition uses the "loc" container.
+    '''
+    @staticmethod
+    def _fields(cmd_tshark, capture_file, test_env, pass_args, display_filter, *fields):
+        command = [cmd_tshark, *pass_args, '-r', capture_file('moq-loc.pcapng.gz'),
+                   '-Y', display_filter, '-T', 'fields', '-E', 'occurrence=a']
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_moq_loc_moqt_tracks(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Objects resolve their track and the Track Property codec string.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moqt.object.payload', 'moqt.track_alias',
+                            'moqt.object.track_namespace', 'moqt.object.track_name',
+                            'moq_loc.codec')
+        assert rows == [
+            ['1', 'live,live', 'video,video', 'avc1.42000a,avc1.42000a'],
+            ['2,2', 'live,live', 'audio,audio', 'opus,opus'],
+        ]
+
+    def test_moq_loc_moqt_video(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Video properties decode, and length-prefixed NAL units reach H.264.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moqt.object.track_name == "video"',
+                            'moq_loc.timescale', 'moq_loc.timestamp',
+                            'moq_loc.vfm.independent', 'moq_loc.vfm.tl0picidx',
+                            'moq_loc.config.nal_length_size', 'moq_loc.media_time',
+                            'h264.nal_unit_hdr')
+        assert rows == [['90000,90000', '0,3000', 'True,False', '1', '4',
+                         '0.000000000,0.033333333', '7,8,5,1']]
+
+    def test_moq_loc_moqt_audio(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Audio Level and wall-clock Timestamps; the payload reaches Opus.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moqt.object.track_name == "audio"',
+                            'moq_loc.audio_level.voice', 'moq_loc.audio_level.dbov',
+                            'moq_loc.capture_time', 'opus')
+        assert len(rows) == 1
+        voice, dbov, times, _ = rows[0]
+        assert voice == 'True,False'
+        assert dbov == '37,127'
+        assert [t.split('.')[-1][:6] for t in times.split(',')] == ['000000', '020000']
+
+    def test_moq_loc_hang_frames(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''hang's "loc" container frames, in both property numberings.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            'moq_hang.container == 2', 'moq_loc.version',
+                            'moq_loc.codec', 'moq_loc.timestamp', 'h264.nal_unit_hdr',
+                            'h264.nal_unit_type')
+        # The first frame's parameter sets appear in its VIDEO_CONFIG and in its
+        # payload; the second frame is an Annex B byte stream.
+        assert rows == [['3,3,2', 'avc1.42000a,avc1.42000a,avc1.42000a',
+                         '0,3000,1790000000066666', '7,8,7,8,5,1', '1']]
+
+    def test_moq_loc_no_errors(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Nothing is malformed or reported as an error.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            '_ws.malformed || _ws.expert.severity >= error',
+                            'frame.number')
+        assert rows == []
 
 
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])

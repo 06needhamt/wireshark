@@ -37,8 +37,8 @@
  * first pass and remembered with the frame number that introduced them, so
  * a rendition whose container changes mid capture is decoded consistently.
  *
- * Not dissected: the recording format (section 9), which is data at rest,
- * and the LOC property block, which is shown undecoded.
+ * Not dissected: the recording format (section 9), which is data at rest.
+ * LOC frames are handed to the "moq_loc.frame" dissector.
  */
 
 #include "config.h"
@@ -53,6 +53,7 @@
 #include <wsutil/wsjson.h>
 
 #include "packet-moq-lite.h"
+#include "packet-moq-loc.h"
 
 void proto_register_moq_hang(void);
 void proto_reg_handoff_moq_hang(void);
@@ -88,6 +89,7 @@ static dissector_handle_t json_handle;
 static dissector_handle_t xml_handle;
 static dissector_handle_t opus_handle;
 static dissector_handle_t mp4_handle;
+static dissector_handle_t loc_frame_handle;
 
 /* Preferences */
 static bool hang_decode_all_broadcasts;
@@ -721,8 +723,14 @@ hang_dissect_media(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, proto_it
         }
         break;
     case HANG_CONTAINER_LOC:
-        proto_tree_add_expert_format_remaining(tree, pinfo, &ei_hang_undecoded, tvb, 0,
-                                     "LOC frame (property block and codec payload) not decoded");
+        if (loc_frame_handle != NULL && tvb_reported_length(tvb) > 0) {
+            moq_loc_frame_info_t loc_info = { def != NULL ? def->codec : NULL };
+
+            call_dissector_with_data(loc_frame_handle, tvb, pinfo, tree, &loc_info);
+        } else {
+            proto_tree_add_expert_format_remaining(tree, pinfo, &ei_hang_undecoded, tvb, 0,
+                                         "LOC frame (property block and codec payload) not decoded");
+        }
         break;
     default:
         proto_tree_add_expert_remaining(tree, pinfo, &ei_hang_unknown_container, tvb, 0);
@@ -1014,6 +1022,7 @@ proto_reg_handoff_moq_hang(void)
     xml_handle = find_dissector_add_dependency("xml", proto_moq_hang);
     opus_handle = find_dissector_add_dependency("opus", proto_moq_hang);
     mp4_handle = find_dissector_add_dependency("mp4", proto_moq_hang);
+    loc_frame_handle = find_dissector_add_dependency("moq_loc.frame", proto_moq_hang);
 }
 
 /*
