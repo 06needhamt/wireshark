@@ -1272,6 +1272,7 @@ set(DISSECTOR_SRC
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-moq-loc.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-moq-locmaf.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-moq-msf.c
+	${CMAKE_CURRENT_SOURCE_DIR}/packet-moq-nmsf.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-moqt.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-mount.c
 	${CMAKE_CURRENT_SOURCE_DIR}/packet-mp2t.c

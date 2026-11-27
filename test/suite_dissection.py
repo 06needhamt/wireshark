@@ -3551,6 +3551,48 @@ class TestDissectMoqLocmaf:
 
 
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
+class TestDissectMoqNmsf:
+    '''
+    NMSF "nvc" Objects in an MSF broadcast, generated with
+    tools/generate-moq-nmsf-capture.py: a single-track mode track and a
+    two-track hyperprior/latent pair.
+    '''
+    @staticmethod
+    def _fields(cmd_tshark, capture_file, test_env, pass_args, display_filter, *fields):
+        command = [cmd_tshark, *pass_args, '-r', capture_file('moq-nmsf.pcapng.gz'),
+                   '-Y', display_filter, '-T', 'fields', '-E', 'occurrence=a']
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_moq_nmsf_headers(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''The 26-byte Object headers, with the codec from the catalog.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moq_nmsf',
+                            'moqt.object.track_name', 'moq_nmsf.codec',
+                            'moq_nmsf.frame_type', 'moq_nmsf.qp', 'moq_nmsf.frame_number',
+                            'moq_nmsf.width', 'moq_nmsf.payload_len')
+        assert rows == [
+            ['video,video', 'dcvc-rt,dcvc-rt', '0x00,0x01', '21,21', '0,1', '256,256',
+             '84,84'],
+            ['video-z', 'dcvc-rt', '0x00', '30', '0', '256', '28'],
+            ['video-y', 'dcvc-rt', '0x00', '30', '0', '256', '56'],
+        ]
+
+    def test_moq_nmsf_tensors(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Single-track Objects hold two tensors; each of the pair holds one.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moq_nmsf',
+                            'moq_nmsf.tensor.height', 'moq_nmsf.tensor.data_len')
+        assert rows == [['2,8,2,8', '12,40,12,40'], ['2', '12'], ['8', '40']]
+
+    def test_moq_nmsf_no_errors(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Nothing is malformed or reported as an error.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            '_ws.malformed || _ws.expert.severity >= warning', 'frame.number')
+        assert rows == []
+
+
+@pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
 class TestDissectWebTransport:
     '''
     WebTransport over HTTP/3, generated with tools/generate-webtransport-capture.py.
