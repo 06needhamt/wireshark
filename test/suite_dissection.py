@@ -3073,6 +3073,77 @@ class TestDissectMoqt:
             cmd_tshark, capture_path, test_env,
             '_ws.malformed || _ws.expert.severity == error') == []
 
+    @staticmethod
+    def _cbor(value):
+        '''A minimal CBOR encoder: int, bytes, str, list, dict and ("tag", n, v).'''
+        def head(major, n):
+            for length, info in ((0, None), (1, 24), (2, 25), (4, 26), (8, 27)):
+                if length == 0 and n < 24:
+                    return bytes([major << 5 | n])
+                if length and n < 1 << (8 * length):
+                    return bytes([major << 5 | info]) + n.to_bytes(length, 'big')
+            raise ValueError(n)
+        cbor = TestDissectMoqt._cbor
+        if isinstance(value, tuple):
+            return head(6, value[1]) + cbor(value[2])
+        if isinstance(value, int):
+            return head(0, value) if value >= 0 else head(1, -1 - value)
+        if isinstance(value, bytes):
+            return head(2, len(value)) + value
+        if isinstance(value, str):
+            return head(3, len(value.encode())) + value.encode()
+        if isinstance(value, list):
+            return head(4, len(value)) + b''.join(cbor(v) for v in value)
+        return head(5, len(value)) + b''.join(cbor(k) + cbor(v) for k, v in value.items())
+
+    def test_moqt_auth_tokens(
+            self, cmd_text2pcap, cmd_tshark, result_file, base_env, test_env):
+        '''CAT, Privacy Pass and libloc's Token Type 0 forms in AUTHORIZATION_TOKEN.'''
+        vi = self._vi64
+        lp = lambda value: vi(len(value)) + value  # noqa: E731
+        cbor = self._cbor
+        claims = cbor({1: 'issuer.example', 4: 1790003600, 6: 1790000000, 7: b'\x01\x02',
+                       308: 1, -65537: {0: [[[4, 7], [b'live', [1, b'room']], b'video']]}})
+        cat = cbor(('tag', 61, ('tag', 18, [cbor({1: -7}), {}, claims, b'\x00' * 64])))
+        privacy_pass = (bytes.fromhex('0002') + b'\x11' * 32 + b'\x22' * 32 +
+                        b'\x33' * 32 + b'\x44' * 256)
+        libloc = b'\x03' + cbor({2: 'alice', 327: [[[0, 4], [b'live'], b'audio']]})
+        token = lambda token_type, value: vi(3) + vi(token_type) + value  # noqa: E731
+        track = self._namespace((b'live',)) + vi(5) + b'video'
+
+        def subscribe(request_id, token_value):
+            return self._message(0x03, vi(request_id) + track + self._parameters(
+                ((0x03, lp(token_value)),)))
+
+        packets = (
+            self._message(0x2f00, self._key_values(((0x03, lp(token(1, cat))),))),
+            subscribe(0, token(0x50505400, privacy_pass)),
+            subscribe(2, token(0, libloc)),
+            subscribe(4, token(0, b'\x7fopaque')),
+        )
+        capture_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env, 'moqt-auth', 'moqt', packets)
+
+        rows = self._field_rows(
+            cmd_tshark, capture_path, test_env, 'moqt',
+            ('moqt.token.type', 'moq_auth.cose', 'moq_auth.iss', 'moq_auth.catreplay',
+             'moq_auth.moqt.revision', 'moq_auth.action', 'moq_auth.ns_match',
+             'moq_auth.track_match', 'moq_auth.privacy_pass.token_type',
+             'moq_auth.libloc_form', 'moq_auth.sub'))
+        assert rows == [
+            ['1', '18', 'issuer.example', '1', 'c4m-02', '4,7',
+             "['live', [1, 'room']]", "'video'", '', '', ''],
+            ['1347441664', '', '', '', '', '', '', '', '2', '', ''],
+            ['0', '', '', '', 'c4m-01', '0,4', "['live']", "'audio'", '', '3', 'alice'],
+            ['0', '', '', '', '', '', '', '', '', '', ''],
+        ]
+        assert self._field_rows(cmd_tshark, capture_path, test_env, 'frame.number == 1',
+                                ('moq_auth.exp', 'moq_auth.cti')) == [
+            ['2026-09-21T15:13:20.000000000Z', '0102']]
+        assert self._matching_frames(
+            cmd_tshark, capture_path, test_env,
+            '_ws.malformed || _ws.expert.severity >= warning') == []
+
     def test_moqt_draft16_track_resolution(
             self, cmd_text2pcap, cmd_tshark, result_file,
             base_env, test_env):

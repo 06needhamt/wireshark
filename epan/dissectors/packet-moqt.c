@@ -205,6 +205,7 @@ static dissector_handle_t moqt_datagram_handles[8];
 static int proto_moqt;
 
 static dissector_table_t moqt_property_table;
+static dissector_table_t moqt_auth_token_table;
 static dissector_table_t moqt_track_name_table;
 static heur_dissector_list_t moqt_payload_heur_list;
 
@@ -1482,9 +1483,31 @@ moqt_dissect_token(moqt_cursor_t *cursor)
         break;
     }
     if (alias_type == 1 || alias_type == 3) {
-        moqt_cursor_varint(cursor, hf_moqt_token_type, NULL,
-                           "authorization token type");
+        uint64_t token_type;
+        int value_offset;
+
+        if (!moqt_cursor_varint(cursor, hf_moqt_token_type, &token_type,
+                                "authorization token type")) {
+            return;
+        }
+        value_offset = cursor->offset;
         moqt_cursor_remainder(cursor, hf_moqt_token_value);
+        /* CAT, Privacy Pass and other Token Types decode their values. */
+        if (cursor->phase == MOQT_DISSECT && !cursor->failed &&
+            value_offset < cursor->end && token_type <= UINT32_MAX) {
+            tvbuff_t *value_tvb = tvb_new_subset_length(cursor->tvb, value_offset,
+                                                        cursor->end - value_offset);
+
+            TRY {
+                dissector_try_uint(moqt_auth_token_table, (uint32_t)token_type,
+                                   value_tvb, cursor->pinfo, cursor->tree);
+            }
+            CATCH_NONFATAL_ERRORS {
+                show_exception(value_tvb, cursor->pinfo, cursor->tree,
+                               EXCEPT_CODE, GET_MESSAGE);
+            }
+            ENDTRY;
+        }
     }
 }
 
@@ -5272,6 +5295,8 @@ proto_register_moqt(void)
 
     moqt_property_table = register_dissector_table(
         "moqt.property", "MOQT Property type", proto_moqt, FT_UINT32, BASE_HEX);
+    moqt_auth_token_table = register_dissector_table(
+        "moqt.auth_token_type", "MOQT Auth Token Type", proto_moqt, FT_UINT32, BASE_HEX);
     moqt_track_name_table = register_dissector_table(
         "moqt.track_name", "MOQT Track Name", proto_moqt, FT_STRING,
         STRING_CASE_SENSITIVE);
