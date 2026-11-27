@@ -2239,6 +2239,22 @@ moqt_dissect_kv_pairs(moqt_cursor_t *cursor, moqt_kv_kind_t kind,
             if (immutable && !nested) {
                 if (moqt_cursor_block(&pair, *fields->hf_length, &value,
                                       "immutable properties")) {
+                    moqt_property_list_t *list = moqt_cursor_property_list(&pair);
+
+                    /*
+                     * Keep the block as one property too: formats that predate
+                     * IMMUTABLE (moq-mi draft-02) used the type for their own data.
+                     */
+                    if (list) {
+                        moqt_property_t property = {
+                            .type = previous_type,
+                            .length = (unsigned)(value.end - value.offset),
+                            .data = tvb_memdup(cursor->pinfo->pool, cursor->tvb,
+                                               value.offset, value.end - value.offset),
+                        };
+
+                        moqt_property_list_append(list, &property);
+                    }
                     proto_item_set_len(item, pair.offset - pair_start);
                     outer = container;
                     outer.offset = pair.offset;

@@ -3593,6 +3593,57 @@ class TestDissectMoqNmsf:
 
 
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
+class TestDissectMoqMi:
+    '''
+    MoQ Media Interop over MOQT draft 23, generated with
+    tools/generate-moq-mi-capture.py: draft-03 and draft-02 H.264, Opus and
+    text with metadata in Object Properties, and draft-01 Opus with the
+    metadata in the payload.
+    '''
+    @staticmethod
+    def _fields(cmd_tshark, capture_file, test_env, pass_args, display_filter, *fields):
+        command = [cmd_tshark, *pass_args, '-r', capture_file('moq-mi.pcapng.gz'),
+                   '-Y', display_filter, '-T', 'fields', '-E', 'occurrence=a']
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_moq_mi_metadata(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Each track's draft, Media Type and metadata.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moq_mi',
+                            'moqt.object.track_name', 'moq_mi.version',
+                            'moq_mi.media_type', 'moq_mi.seq_id', 'moq_mi.pts',
+                            'moq_mi.timebase', 'moq_mi.sample_freq', 'moq_mi.text')
+        assert rows == [
+            ['video0', '3', '0', '0', '90000', '90000', '', ''],
+            ['video1', '2', '0', '1', '3000', '90000', '', ''],
+            ['audio0', '23', '1', '7', '960', '48000', '48000', ''],
+            ['text0', '23', '2', '3', '', '', '', 'hello, mi'],
+            ['audio1', '1', '1', '8', '1920', '48000', '48000', ''],
+        ]
+
+    def test_moq_mi_media(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''H.264 and Opus payloads reach their dissectors.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args, 'moq_mi',
+                            'moqt.object.track_name', 'h264.nal_unit_hdr', 'opus')
+        nals = {row[0]: row[1] for row in rows}
+        # video0's configuration record is decoded both as a MOQT property
+        # (LOC's VIDEO_CONFIG) and by moq-mi.
+        assert nals['video0'] == '7,8,7,8,5'
+        assert nals['video1'] == '1'
+        assert [row[0] for row in rows if row[2]] == ['audio0', 'audio1']
+
+    def test_moq_mi_no_errors(self, cmd_tshark, capture_file, test_env, pass_args):
+        '''Only draft-02's H.264 metadata, whose type MOQT now calls
+        IMMUTABLE, is reported, by MOQT.'''
+        rows = self._fields(cmd_tshark, capture_file, test_env, pass_args,
+                            '_ws.malformed || _ws.expert.severity >= error',
+                            'moqt.object.track_name', 'moq_mi.version')
+        assert rows == [['video1', '2']]
+
+
+@pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
 class TestDissectWebTransport:
     '''
     WebTransport over HTTP/3, generated with tools/generate-webtransport-capture.py.

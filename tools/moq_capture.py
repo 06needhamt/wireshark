@@ -21,6 +21,14 @@ from cryptography.x509.oid import NameOID
 
 SERVER = ("192.0.2.2", 4443)
 
+# A minimal H.264 baseline SPS and PPS, an IDR slice and a non-IDR slice.
+SPS = bytes.fromhex("6742000af841a2")
+PPS = bytes.fromhex("68ce3880")
+IDR = bytes.fromhex("65888040") + b"\x00" * 12
+SLICE = bytes.fromhex("419a0204") + b"\x00" * 8
+AVCC = bytes([1, 0x42, 0x00, 0x0A, 0xFF, 0xE1]) + struct.pack("!H", len(SPS)) + SPS + \
+    bytes([1]) + struct.pack("!H", len(PPS)) + PPS
+
 
 def qv(value):
     """QUIC variable-length integer."""
