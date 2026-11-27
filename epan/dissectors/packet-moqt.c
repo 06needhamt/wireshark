@@ -11,9 +11,13 @@
 
 #include "config.h"
 
+#include <epan/conversation.h>
+#include <epan/exceptions.h>
 #include <epan/expert.h>
 #include <epan/packet.h>
+#include <epan/show_exception.h>
 
+#include "packet-moqt.h"
 #include "packet-quic.h"
 
 /*
@@ -200,6 +204,10 @@ static dissector_handle_t moqt_datagram_handles[8];
 
 static int proto_moqt;
 
+static dissector_table_t moqt_property_table;
+static dissector_table_t moqt_track_name_table;
+static heur_dissector_list_t moqt_payload_heur_list;
+
 static int hf_moqt_draft;
 static int hf_moqt_stream_type;
 static int hf_moqt_message_type;
@@ -219,6 +227,8 @@ static int hf_moqt_namespace_field_length;
 static int hf_moqt_namespace_field;
 static int hf_moqt_track_name_length;
 static int hf_moqt_track_name;
+static int hf_moqt_object_track_namespace;
+static int hf_moqt_object_track_name;
 static int hf_moqt_parameter_count;
 static int hf_moqt_parameter_type_delta;
 static int hf_moqt_parameter_type;
@@ -784,12 +794,61 @@ typedef struct {
     wmem_map_t *before_pdu;
 } moqt_stream_t;
 
+/*
+ * Tracks are learned from the requests that name them. A binding maps a
+ * Request ID, Track Alias or request stream to a track from a given frame on;
+ * older bindings of the same key stay reachable so that redissection resolves
+ * a key as it was at that frame.
+ */
+typedef struct {
+    const char *track_namespace;
+    const char *track_name;
+    moqt_property_t *properties;     /* Track Properties, file scope */
+    unsigned property_count;
+} moqt_track_t;
+
+typedef struct moqt_binding moqt_binding_t;
+struct moqt_binding {
+    moqt_track_t *track;
+    uint32_t frame;
+    moqt_binding_t *older;
+};
+
+typedef struct {
+    wmem_map_t *by_request_id;
+    wmem_map_t *by_track_alias;
+    wmem_map_t *by_stream;
+    moqt_binding_t *last_request;    /* exported PDUs, which have no stream */
+} moqt_session_t;
+
+/* A growable property list, for Object or Track Properties. */
+typedef struct {
+    wmem_allocator_t *scope;
+    moqt_property_t *items;
+    unsigned count;
+    unsigned capacity;
+} moqt_property_list_t;
+
+/* What one control message says about a track; filled while dissecting. */
+typedef struct {
+    bool request_id_set;
+    uint64_t request_id;
+    bool track_alias_set;
+    uint64_t track_alias;
+    const char *track_namespace;
+    const char *track_name;
+    moqt_property_list_t properties;
+} moqt_capture_t;
+
 typedef struct {
     tvbuff_t *tvb;
     packet_info *pinfo;
     proto_tree *tree;
     const moqt_draft_t *draft;
     moqt_parse_phase_t phase;
+    quic_stream_info *stream_info;   /* NULL for datagrams and exported PDUs */
+    moqt_capture_t *capture;         /* set while dissecting a control message */
+    moqt_property_list_t *properties; /* set while dissecting an Object */
     int offset;
     int end;
     int needed;
@@ -1054,6 +1113,17 @@ moqt_cursor_varint(moqt_cursor_t *cursor, int hf, uint64_t *value,
         proto_tree_add_uint64(cursor->tree, hf, cursor->tvb,
                               cursor->offset, length, decoded);
     }
+    /* A message's own Request ID and Track Alias come before any other. */
+    if (cursor->capture && cursor->phase == MOQT_DISSECT) {
+        if (hf == hf_moqt_request_id && !cursor->capture->request_id_set) {
+            cursor->capture->request_id_set = true;
+            cursor->capture->request_id = decoded;
+        } else if (hf == hf_moqt_track_alias &&
+                   !cursor->capture->track_alias_set) {
+            cursor->capture->track_alias_set = true;
+            cursor->capture->track_alias = decoded;
+        }
+    }
     cursor->offset += length;
     if (value) {
         *value = decoded;
@@ -1271,7 +1341,7 @@ moqt_dissect_namespace(moqt_cursor_t *cursor, const char *label)
     moqt_cursor_t nested;
     uint64_t count;
     int start = cursor->offset;
-    wmem_strbuf_t *text = NULL;
+    wmem_strbuf_t *text = NULL, *raw = NULL;
 
     if (cursor->failed) {
         return false;
@@ -1293,6 +1363,9 @@ moqt_dissect_namespace(moqt_cursor_t *cursor, const char *label)
     }
     if (cursor->phase == MOQT_DISSECT) {
         text = wmem_strbuf_new(cursor->pinfo->pool, "");
+        if (cursor->capture && strcmp(label, "Track Namespace") == 0) {
+            raw = wmem_strbuf_new(cursor->pinfo->pool, "");
+        }
     }
     for (uint64_t i = 0; i < count && !nested.failed; i++) {
         uint64_t length;
@@ -1306,10 +1379,21 @@ moqt_dissect_namespace(moqt_cursor_t *cursor, const char *label)
             }
             moqt_append_name(text, cursor->tvb, nested.offset - (int)length,
                              (int)length);
+            if (raw) {
+                if (i != 0) {
+                    wmem_strbuf_append_c(raw, '/');
+                }
+                wmem_strbuf_append(raw, (const char *)tvb_get_string_enc(
+                    cursor->pinfo->pool, cursor->tvb,
+                    nested.offset - (int)length, (int)length, ENC_UTF_8));
+            }
         }
     }
     if (text) {
         proto_item_append_text(item, ": %s", wmem_strbuf_get_str(text));
+    }
+    if (raw && !nested.failed) {
+        cursor->capture->track_namespace = wmem_strbuf_get_str(raw);
     }
     proto_item_set_len(item, nested.offset - start);
     moqt_cursor_finish_nested(cursor, &nested);
@@ -1319,9 +1403,17 @@ moqt_dissect_namespace(moqt_cursor_t *cursor, const char *label)
 static void
 moqt_dissect_track_name(moqt_cursor_t *cursor)
 {
-    moqt_cursor_length_prefixed(cursor, hf_moqt_track_name_length,
-                                hf_moqt_track_name, NULL,
-                                "track name", ENC_NA);
+    uint64_t length;
+
+    if (moqt_cursor_length_prefixed(cursor, hf_moqt_track_name_length,
+                                    hf_moqt_track_name, &length,
+                                    "track name", ENC_NA) &&
+        cursor->capture && !cursor->capture->track_name &&
+        cursor->phase == MOQT_DISSECT) {
+        cursor->capture->track_name = (const char *)tvb_get_string_enc(
+            cursor->pinfo->pool, cursor->tvb, cursor->offset - (int)length,
+            (int)length, ENC_UTF_8);
+    }
 }
 
 static void
@@ -1946,6 +2038,71 @@ static const moqt_kv_fields_t moqt_error_detail_fields = {
 
 static void moqt_dissect_redirect(moqt_cursor_t *cursor);
 
+static moqt_property_list_t *
+moqt_cursor_property_list(moqt_cursor_t *cursor)
+{
+    if (cursor->phase != MOQT_DISSECT) {
+        return NULL;
+    }
+    if (cursor->properties) {
+        return cursor->properties;
+    }
+    return cursor->capture ? &cursor->capture->properties : NULL;
+}
+
+static void
+moqt_property_list_append(moqt_property_list_t *list, const moqt_property_t *property)
+{
+    if (list->count == list->capacity) {
+        list->capacity = list->capacity ? list->capacity * 2 : 8;
+        list->items = wmem_realloc(list->scope, list->items,
+                                   list->capacity * sizeof(moqt_property_t));
+    }
+    list->items[list->count++] = *property;
+}
+
+/*
+ * Record a property for the payload dissectors and offer its value to the
+ * "moqt.property" table, which decodes properties other specifications
+ * register (LOC, Secure Objects, ...).
+ */
+static void
+moqt_handoff_property(moqt_cursor_t *cursor, uint64_t type, uint64_t integer,
+                      int offset, int length)
+{
+    moqt_property_list_t *list = moqt_cursor_property_list(cursor);
+    moqt_property_info_t info = {
+        .draft = cursor->draft->version,
+        .type = type,
+        .integer = integer,
+        .track_scope = cursor->properties == NULL,
+    };
+    moqt_property_t property = { .type = type, .integer = integer };
+
+    if (!list) {
+        return;
+    }
+    if ((type & 1) != 0) {
+        property.length = (unsigned)length;
+        property.data = tvb_memdup(cursor->pinfo->pool, cursor->tvb, offset, length);
+    }
+    moqt_property_list_append(list, &property);
+    if (type <= UINT32_MAX && length >= 0) {
+        tvbuff_t *value_tvb = tvb_new_subset_length(cursor->tvb, offset, length);
+
+        TRY {
+            dissector_try_uint_with_data(moqt_property_table, (uint32_t)type,
+                                         value_tvb, cursor->pinfo, cursor->tree,
+                                         false, &info);
+        }
+        CATCH_NONFATAL_ERRORS {
+            show_exception(value_tvb, cursor->pinfo, cursor->tree,
+                           EXCEPT_CODE, GET_MESSAGE);
+        }
+        ENDTRY;
+    }
+}
+
 static void
 moqt_dissect_kv_value(moqt_cursor_t *cursor, const moqt_kv_fields_t *fields,
                       moqt_kv_kind_t kind, uint64_t type)
@@ -1959,9 +2116,13 @@ moqt_dissect_kv_value(moqt_cursor_t *cursor, const moqt_kv_fields_t *fields,
                  type == MOQT_ERROR_DETAIL_UNSUPPORTED_PROPERTY &&
                  cursor->error_code == 0x33
                      ? hf_moqt_property_type : *fields->hf_integer;
+        uint64_t integer;
 
-        moqt_cursor_varint(cursor, hf, NULL,
-                           "key-value integer");
+        if (moqt_cursor_varint(cursor, hf, &integer, "key-value integer") &&
+            kind == MOQT_KV_PROPERTY) {
+            moqt_handoff_property(cursor, type, integer, length_start,
+                                  cursor->offset - length_start);
+        }
         return;
     }
     if (!moqt_cursor_block(cursor, *fields->hf_length,
@@ -1996,7 +2157,17 @@ moqt_dissect_kv_value(moqt_cursor_t *cursor, const moqt_kv_fields_t *fields,
         cursor->redirect_present = true;
         moqt_dissect_redirect(&value);
     }
-    moqt_cursor_remainder(&value, *fields->hf_value);
+    if (kind == MOQT_KV_PROPERTY && !value.failed) {
+        int value_offset = value.offset;
+
+        moqt_cursor_remainder(&value, *fields->hf_value);
+        if (!value.failed) {
+            moqt_handoff_property(&value, type, 0, value_offset,
+                                  value.end - value_offset);
+        }
+    } else {
+        moqt_cursor_remainder(&value, *fields->hf_value);
+    }
     cursor->failed = value.failed;
 }
 
@@ -2818,6 +2989,265 @@ moqt_find_message(const moqt_draft_t *draft, uint64_t type)
     return NULL;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Track resolution                                                          */
+/* ------------------------------------------------------------------------- */
+
+static moqt_session_t *
+moqt_session_get(packet_info *pinfo)
+{
+    conversation_t *conversation = find_or_create_conversation(pinfo);
+    moqt_session_t *session =
+        (moqt_session_t *)conversation_get_proto_data(conversation, proto_moqt);
+
+    if (!session) {
+        session = wmem_new0(wmem_file_scope(), moqt_session_t);
+        session->by_request_id =
+            wmem_map_new(wmem_file_scope(), g_int64_hash, g_int64_equal);
+        session->by_track_alias =
+            wmem_map_new(wmem_file_scope(), g_int64_hash, g_int64_equal);
+        session->by_stream =
+            wmem_map_new(wmem_file_scope(), g_int64_hash, g_int64_equal);
+        conversation_add_proto_data(conversation, proto_moqt, session);
+    }
+    return session;
+}
+
+static moqt_track_t *
+moqt_binding_resolve(const moqt_binding_t *binding, uint32_t frame)
+{
+    for (; binding; binding = binding->older) {
+        if (binding->frame <= frame) {
+            return binding->track;
+        }
+    }
+    return NULL;
+}
+
+static moqt_track_t *
+moqt_lookup(wmem_map_t *map, uint64_t key, uint32_t frame)
+{
+    return moqt_binding_resolve(
+        (const moqt_binding_t *)wmem_map_lookup(map, &key), frame);
+}
+
+static moqt_binding_t *
+moqt_new_binding(moqt_track_t *track, uint32_t frame, moqt_binding_t *older)
+{
+    moqt_binding_t *binding = wmem_new(wmem_file_scope(), moqt_binding_t);
+
+    binding->track = track;
+    binding->frame = frame;
+    binding->older = older;
+    return binding;
+}
+
+static void
+moqt_bind(wmem_map_t *map, uint64_t key, moqt_track_t *track, uint32_t frame)
+{
+    moqt_binding_t *older = (moqt_binding_t *)wmem_map_lookup(map, &key);
+    uint64_t *stored_key;
+
+    if (older && older->track == track) {
+        return;
+    }
+    stored_key = wmem_new(wmem_file_scope(), uint64_t);
+    *stored_key = key;
+    wmem_map_insert(map, stored_key, moqt_new_binding(track, frame, older));
+}
+
+/*
+ * Learn from one dissected control message, on the first pass only. A
+ * message naming a track (SUBSCRIBE, PUBLISH, FETCH, ...) binds its Request
+ * ID and request stream to it. A message with a Track Alias (SUBSCRIBE_OK,
+ * PUBLISH) binds the alias to the track it names, or else to the one its
+ * Request ID or request stream was bound to.
+ */
+static void
+moqt_session_learn(moqt_cursor_t *cursor, const moqt_capture_t *capture)
+{
+    packet_info *pinfo = cursor->pinfo;
+    moqt_session_t *session;
+    moqt_track_t *track = NULL;
+    uint32_t frame = pinfo->num;
+
+    if (PINFO_FD_VISITED(pinfo) ||
+        (!capture->track_alias_set &&
+         !(capture->track_namespace && capture->track_name))) {
+        return;
+    }
+    session = moqt_session_get(pinfo);
+    if (capture->track_namespace && capture->track_name) {
+        track = wmem_new0(wmem_file_scope(), moqt_track_t);
+        track->track_namespace = wmem_strdup(wmem_file_scope(),
+                                             capture->track_namespace);
+        track->track_name = wmem_strdup(wmem_file_scope(), capture->track_name);
+        if (capture->request_id_set) {
+            moqt_bind(session->by_request_id, capture->request_id, track, frame);
+        }
+        if (cursor->stream_info) {
+            moqt_bind(session->by_stream, cursor->stream_info->stream_id,
+                      track, frame);
+        } else {
+            session->last_request =
+                moqt_new_binding(track, frame, session->last_request);
+        }
+    } else if (capture->request_id_set) {
+        track = moqt_lookup(session->by_request_id, capture->request_id, frame);
+    }
+    if (!track && !capture->request_id_set) {
+        track = cursor->stream_info
+                    ? moqt_lookup(session->by_stream,
+                                  cursor->stream_info->stream_id, frame)
+                    : moqt_binding_resolve(session->last_request, frame);
+    }
+    if (!track || !capture->track_alias_set) {
+        return;
+    }
+    if (capture->properties.count != 0 && track->property_count == 0) {
+        track->property_count = capture->properties.count;
+        track->properties = wmem_alloc_array(wmem_file_scope(), moqt_property_t,
+                                             capture->properties.count);
+        for (unsigned i = 0; i < capture->properties.count; i++) {
+            const moqt_property_t *property = &capture->properties.items[i];
+
+            track->properties[i] = *property;
+            if (property->data) {
+                track->properties[i].data = (const uint8_t *)wmem_memdup(
+                    wmem_file_scope(), property->data, property->length);
+            }
+        }
+    }
+    moqt_bind(session->by_track_alias, capture->track_alias, track, frame);
+}
+
+static const moqt_track_t *
+moqt_track_by_alias(packet_info *pinfo, uint64_t track_alias)
+{
+    return moqt_lookup(moqt_session_get(pinfo)->by_track_alias, track_alias,
+                       pinfo->num);
+}
+
+static const moqt_track_t *
+moqt_track_by_request_id(packet_info *pinfo, uint64_t request_id)
+{
+    return moqt_lookup(moqt_session_get(pinfo)->by_request_id, request_id,
+                       pinfo->num);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Object payloads                                                           */
+/* ------------------------------------------------------------------------- */
+
+static void
+moqt_object_info_init(moqt_object_info_t *info, const moqt_cursor_t *cursor,
+                      const moqt_stream_state_t *state)
+{
+    const moqt_track_t *track = NULL;
+
+    *info = (moqt_object_info_t){ .draft = cursor->draft->version };
+    if (!state) {
+        return;
+    }
+    if (state->kind == MOQT_STREAM_FETCH_DATA) {
+        info->request_id = state->header.fetch_request_id;
+        info->request_id_known = true;
+        track = moqt_track_by_request_id(cursor->pinfo, info->request_id);
+    } else {
+        info->track_alias = state->header.track_alias;
+        info->track_alias_known = true;
+        info->group_id = state->header.group_id;
+        info->group_id_known = true;
+        info->subgroup_id = state->subgroup.subgroup_id;
+        info->subgroup_id_known = state->subgroup.subgroup_id_known;
+        track = moqt_track_by_alias(cursor->pinfo, info->track_alias);
+    }
+    if (track) {
+        info->track_namespace = track->track_namespace;
+        info->track_name = track->track_name;
+        info->track_properties = track->properties;
+        info->track_property_count = track->property_count;
+    }
+}
+
+static void
+moqt_object_info_set_track(moqt_object_info_t *info, packet_info *pinfo,
+                           uint64_t track_alias)
+{
+    const moqt_track_t *track = moqt_track_by_alias(pinfo, track_alias);
+
+    info->track_alias = track_alias;
+    info->track_alias_known = true;
+    if (track) {
+        info->track_namespace = track->track_namespace;
+        info->track_name = track->track_name;
+        info->track_properties = track->properties;
+        info->track_property_count = track->property_count;
+    }
+}
+
+static void
+moqt_add_object_track(moqt_cursor_t *cursor, const moqt_object_info_t *info,
+                      int offset)
+{
+    proto_item *item;
+
+    if (!info->track_name) {
+        return;
+    }
+    item = proto_tree_add_string(cursor->tree, hf_moqt_object_track_namespace,
+                                 cursor->tvb, offset, 0, info->track_namespace);
+    proto_item_set_generated(item);
+    item = proto_tree_add_string(cursor->tree, hf_moqt_object_track_name,
+                                 cursor->tvb, offset, 0, info->track_name);
+    proto_item_set_generated(item);
+}
+
+/*
+ * Show an Object payload as bytes, then offer it to the dissector registered
+ * for its Track Name and to the "moqt.payload" heuristics. Only Normal Objects
+ * reach here; the properties recorded for this Object go with it.
+ */
+static void
+moqt_dissect_object_payload(moqt_cursor_t *cursor, uint64_t length,
+                            moqt_object_info_t *info)
+{
+    int offset = cursor->offset;
+    tvbuff_t *payload_tvb;
+    heur_dtbl_entry_t *entry;
+
+    if (!moqt_cursor_bytes(cursor, hf_moqt_object_payload, length,
+                           "object payload", ENC_NA) ||
+        cursor->phase != MOQT_DISSECT) {
+        return;
+    }
+    if (cursor->properties) {
+        info->properties = cursor->properties->items;
+        info->property_count = cursor->properties->count;
+    }
+    moqt_add_object_track(cursor, info, offset);
+    if (length == 0) {
+        return;
+    }
+    payload_tvb = tvb_new_subset_length(cursor->tvb, offset, (int)length);
+    TRY {
+        /* Otherwise the payload stays as the bytes already shown. */
+        if (!info->track_name ||
+            !dissector_try_string_with_data(moqt_track_name_table,
+                                            info->track_name, payload_tvb,
+                                            cursor->pinfo, cursor->tree, true,
+                                            info)) {
+            dissector_try_heuristic(moqt_payload_heur_list, payload_tvb,
+                                    cursor->pinfo, cursor->tree, &entry, info);
+        }
+    }
+    CATCH_NONFATAL_ERRORS {
+        show_exception(payload_tvb, cursor->pinfo, cursor->tree,
+                       EXCEPT_CODE, GET_MESSAGE);
+    }
+    ENDTRY;
+}
+
 /* Type (vi64), Length (16 before draft 23, vi64 thereafter), bounded body. */
 static void
 moqt_draft18_parse_message(moqt_cursor_t *cursor, moqt_stream_state_t *state)
@@ -2869,7 +3299,16 @@ moqt_draft18_parse_message(moqt_cursor_t *cursor, moqt_stream_state_t *state)
                           length_offset, length_size, body_length);
     col_append_sep_str(cursor->pinfo->cinfo, COL_INFO, ", ", name);
     if (message) {
+        moqt_capture_t capture = {
+            .properties = { .scope = cursor->pinfo->pool },
+        };
+
+        body.capture = &capture;
         message->decode(&body, state);
+        body.capture = NULL;
+        if (!body.failed) {
+            moqt_session_learn(&body, &capture);
+        }
     } else {
         proto_tree_add_expert_format(
             body.tree, cursor->pinfo, &ei_moqt_unknown_message, cursor->tvb,
@@ -3059,12 +3498,16 @@ moqt_draft18_parse_subgroup_object(moqt_cursor_t *cursor,
     uint64_t properties_length = 0;
     uint64_t payload_length;
     uint64_t status = MOQT_OBJECT_NORMAL;
+    uint64_t object_id = 0;
+    bool object_id_resolved = false;
+    moqt_property_list_t properties = { .scope = cursor->pinfo->pool };
     int start = cursor->offset;
     int status_offset;
 
     object.tree = proto_tree_add_subtree(
         cursor->tree, cursor->tvb, start, -1, ett_moqt_object,
         &item, "Subgroup Object");
+    object.properties = &properties;
     if (!moqt_cursor_varint(&object, hf_moqt_object_id_delta, &delta,
                             "object ID delta")) {
         goto finished;
@@ -3084,14 +3527,20 @@ moqt_draft18_parse_subgroup_object(moqt_cursor_t *cursor,
                                      object.offset - status_offset,
                                      properties_length);
     } else {
-        moqt_cursor_bytes(&object, hf_moqt_object_payload, payload_length,
-                          "object payload", ENC_NA);
+        moqt_object_info_t info;
+
+        object_id_resolved = moqt_resolve_subgroup_object_id(
+            &object, state, delta, start, &object_id);
+        moqt_object_info_init(&info, &object, state);
+        info.object_id = object_id;
+        info.object_id_known = object_id_resolved;
+        moqt_dissect_object_payload(&object, payload_length, &info);
     }
     if (!object.failed && cursor->phase == MOQT_DISSECT) {
-        uint64_t object_id;
-
-        if (moqt_resolve_subgroup_object_id(&object, state, delta, start,
-                                            &object_id)) {
+        if (object_id_resolved ||
+            (payload_length == 0 &&
+             moqt_resolve_subgroup_object_id(&object, state, delta, start,
+                                             &object_id))) {
             proto_item_append_text(item, " %" PRIu64, object_id);
             col_append_sep_fstr(cursor->pinfo->cinfo, COL_INFO, ", ",
                                 "Object %" PRIu64, object_id);
@@ -3169,18 +3618,20 @@ moqt_draft16_parse_subgroup_header(moqt_cursor_t *cursor,
  */
 static void
 moqt_draft16_parse_subgroup_object(moqt_cursor_t *cursor,
-                                   moqt_stream_state_t *state _U_)
+                                   moqt_stream_state_t *state)
 {
     proto_item *item;
     moqt_cursor_t object = *cursor;
     uint64_t object_id;
     uint64_t payload_length;
     uint64_t status = MOQT_OBJECT_NORMAL;
+    moqt_property_list_t properties = { .scope = cursor->pinfo->pool };
     int start = cursor->offset;
 
     object.tree = proto_tree_add_subtree(
         cursor->tree, cursor->tvb, start, -1, ett_moqt_object,
         &item, "Subgroup Object");
+    object.properties = &properties;
     if (!moqt_cursor_varint(&object, hf_moqt_object_id, &object_id, "object ID")) {
         goto finished;
     }
@@ -3203,8 +3654,12 @@ moqt_draft16_parse_subgroup_object(moqt_cursor_t *cursor,
         }
         object.needed = 0;
     } else {
-        moqt_cursor_bytes(&object, hf_moqt_object_payload, payload_length,
-                          "object payload", ENC_NA);
+        moqt_object_info_t info;
+
+        moqt_object_info_init(&info, &object, state);
+        info.object_id = object_id;
+        info.object_id_known = true;
+        moqt_dissect_object_payload(&object, payload_length, &info);
     }
     if (!object.failed && cursor->phase == MOQT_DISSECT) {
         proto_item_append_text(item, " %" PRIu64 ": Payload %" PRIu64 " byte%s",
@@ -3280,8 +3735,12 @@ moqt_add_fetch_flags(moqt_cursor_t *cursor, int offset,
  */
 static void
 moqt_draft18_parse_fetch_fields(moqt_cursor_t *cursor, uint64_t flags,
-                                uint64_t *payload_length)
+                                uint64_t *payload_length,
+                                const moqt_stream_state_t *state)
 {
+    moqt_object_info_t info;
+    uint64_t length;
+
     /* Before draft 18 the Group and Object IDs are absolute. */
     bool absolute = cursor->draft->version < 18;
 
@@ -3322,26 +3781,34 @@ moqt_draft18_parse_fetch_fields(moqt_cursor_t *cursor, uint64_t flags,
             moqt_dissect_object_properties(cursor, NULL);
         }
     }
-    moqt_cursor_length_prefixed(cursor, hf_moqt_object_payload_length,
-                                hf_moqt_object_payload, payload_length,
-                                "object payload", ENC_NA);
+    if (!moqt_cursor_varint(cursor, hf_moqt_object_payload_length, &length,
+                            "object payload length")) {
+        return;
+    }
+    moqt_object_info_init(&info, cursor, state);
+    moqt_dissect_object_payload(cursor, length, &info);
+    if (!cursor->failed && payload_length) {
+        *payload_length = length;
+    }
 }
 
 static void
 moqt_draft18_parse_fetch_object(moqt_cursor_t *cursor,
-                                moqt_stream_state_t *state _U_)
+                                moqt_stream_state_t *state)
 {
     proto_item *item;
     moqt_cursor_t object = *cursor;
     uint64_t flags;
     uint64_t payload_length = 0;
     const char *end_of_range;
+    moqt_property_list_t properties = { .scope = cursor->pinfo->pool };
     int start = cursor->offset;
     int flags_length;
 
     object.tree = proto_tree_add_subtree(
         cursor->tree, cursor->tvb, start, -1, ett_moqt_object,
         &item, "Fetch Object");
+    object.properties = &properties;
     if (!moqt_cursor_varint(&object, -1, &flags, "serialization flags")) {
         goto finished;
     }
@@ -3376,7 +3843,7 @@ moqt_draft18_parse_fetch_object(moqt_cursor_t *cursor,
         }
         moqt_cursor_remainder(&object, hf_moqt_unparsed);
     } else {
-        moqt_draft18_parse_fetch_fields(&object, flags, &payload_length);
+        moqt_draft18_parse_fetch_fields(&object, flags, &payload_length, state);
         proto_item_append_text(item, ": Payload %" PRIu64 " byte%s",
                                payload_length, payload_length == 1 ? "" : "s");
     }
@@ -3722,6 +4189,7 @@ moqt_dissect_stream(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
         .tree = proto_item_add_subtree(protocol_item, ett_moqt),
         .draft = draft,
         .phase = MOQT_DISSECT,
+        .stream_info = stream_info,
         .end = (int)tvb_reported_length(tvb),
     };
 
@@ -3810,14 +4278,39 @@ moqt_add_datagram_type_flags(moqt_cursor_t *cursor, int length, uint64_t type)
                            (type & MOQT_DATAGRAM_STATUS) != 0);
 }
 
+/* The rest of an OBJECT_DATAGRAM is the payload of a Normal Object. */
+static void
+moqt_dissect_datagram_payload(moqt_cursor_t *cursor, uint64_t track_alias,
+                              uint64_t group_id, uint64_t object_id)
+{
+    moqt_object_info_t info = {
+        .draft = cursor->draft->version,
+        .group_id = group_id,
+        .group_id_known = true,
+        .object_id = object_id,
+        .object_id_known = true,
+        .datagram = true,
+    };
+
+    if (cursor->offset >= cursor->end) {
+        return;
+    }
+    moqt_object_info_set_track(&info, cursor->pinfo, track_alias);
+    moqt_dissect_object_payload(cursor, (uint64_t)(cursor->end - cursor->offset),
+                                &info);
+}
+
 static void
 moqt_draft18_parse_datagram_object(moqt_cursor_t *cursor, uint64_t type)
 {
     uint64_t properties_length = 0;
     uint64_t status = MOQT_OBJECT_NORMAL;
     uint64_t track_alias = 0, group_id = 0, object_id = 0;
+    moqt_property_list_t properties = { .scope = cursor->pinfo->pool };
     int properties_offset;
     int status_offset;
+
+    cursor->properties = &properties;
 
     moqt_cursor_varint(cursor, hf_moqt_track_alias, &track_alias, "track alias");
     moqt_cursor_varint(cursor, hf_moqt_group_id, &group_id, "group ID");
@@ -3864,7 +4357,7 @@ moqt_draft18_parse_datagram_object(moqt_cursor_t *cursor, uint64_t type)
     } else {
         col_append_fstr(cursor->pinfo->cinfo, COL_INFO, "%d bytes)",
                         cursor->end - cursor->offset);
-        moqt_cursor_remainder(cursor, hf_moqt_object_payload);
+        moqt_dissect_datagram_payload(cursor, track_alias, group_id, object_id);
     }
 }
 
@@ -3909,7 +4402,10 @@ moqt_draft16_parse_datagram(moqt_cursor_t *cursor)
 {
     uint64_t track_alias = 0, group_id = 0, object_id = 0;
     uint64_t status = MOQT_OBJECT_NORMAL;
+    moqt_property_list_t properties = { .scope = cursor->pinfo->pool };
     int status_offset;
+
+    cursor->properties = &properties;
 
     moqt_cursor_varint(cursor, hf_moqt_track_alias, &track_alias, "track alias");
     moqt_cursor_varint(cursor, hf_moqt_group_id, &group_id, "group ID");
@@ -3940,7 +4436,7 @@ moqt_draft16_parse_datagram(moqt_cursor_t *cursor)
     } else {
         col_append_fstr(cursor->pinfo->cinfo, COL_INFO, "%d bytes)",
                         cursor->end - cursor->offset);
-        moqt_cursor_remainder(cursor, hf_moqt_object_payload);
+        moqt_dissect_datagram_payload(cursor, track_alias, group_id, object_id);
     }
 }
 
@@ -4234,6 +4730,17 @@ proto_register_moqt(void)
           { "Track Name Length", "moqt.track_name.length",
             FT_UINT64, BASE_DEC, NULL, 0x0,
             NULL, HFILL }
+        },
+        { &hf_moqt_object_track_namespace,
+          { "Object Track Namespace", "moqt.object.track_namespace",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "Namespace of the track this Object belongs to, its fields joined by '/'",
+            HFILL }
+        },
+        { &hf_moqt_object_track_name,
+          { "Object Track Name", "moqt.object.track_name",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "Name of the track this Object belongs to", HFILL }
         },
         { &hf_moqt_track_name,
           { "Track Name", "moqt.track_name",
@@ -4692,6 +5199,14 @@ proto_register_moqt(void)
     proto_register_subtree_array(ett, array_length(ett));
     expert_moqt = expert_register_protocol(proto_moqt);
     expert_register_field_array(expert_moqt, ei, array_length(ei));
+
+    moqt_property_table = register_dissector_table(
+        "moqt.property", "MOQT Property type", proto_moqt, FT_UINT32, BASE_HEX);
+    moqt_track_name_table = register_dissector_table(
+        "moqt.track_name", "MOQT Track Name", proto_moqt, FT_STRING,
+        STRING_CASE_SENSITIVE);
+    moqt_payload_heur_list = register_heur_dissector_list_with_description(
+        "moqt.payload", "MOQT Object payload", proto_moqt);
 
     DISSECTOR_ASSERT(array_length(moqt_drafts) == array_length(moqt_handles));
     for (unsigned i = 0; i < array_length(moqt_drafts); i++) {

@@ -3073,6 +3073,34 @@ class TestDissectMoqt:
             cmd_tshark, capture_path, test_env,
             '_ws.malformed || _ws.expert.severity == error') == []
 
+    def test_moqt_draft16_track_resolution(
+            self, cmd_text2pcap, cmd_tshark, result_file,
+            base_env, test_env):
+        '''Objects are tied to their track through SUBSCRIBE_OK's Request ID.'''
+        qv = self._qv
+        message = self._d16_message
+        parameters = self._d16_parameters
+        track = self._d16_namespace((b'live', b'room1')) + qv(5) + b'audio'
+        subgroup = (qv(0x01) + qv(7) + qv(0) + qv(0) + bytes((0x80, 0)) +
+                    # Object 0: CODEC_STRING (0x11) and AUDIO_LEVEL (0x0c).
+                    qv(0) + qv(2) + qv(0x0c) + qv(0x85) + qv(0x05) + qv(4) + b'opus' +
+                    qv(3) + bytes((0xfc, 0x01, 0x02)))
+        packets = (
+            message(0x03, qv(4) + track + parameters(())),
+            message(0x04, qv(4) + qv(7) + parameters(())),
+            subgroup,
+        )
+        capture_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env,
+            'moqt-draft16-tracks', 'moqt', packets, draft=16)
+
+        for pass_args in ((), ('-2',)):
+            assert self._field_rows(
+                cmd_tshark, capture_path, test_env, 'moqt.object.payload',
+                ('moqt.object.track_namespace', 'moqt.object.track_name',
+                 'moqt.property.integer'),
+                extra_args=pass_args) == [['live/room1', 'audio', '133']]
+
     def test_moqt_draft16_data(
             self, cmd_text2pcap, cmd_tshark, result_file,
             base_env, test_env):
