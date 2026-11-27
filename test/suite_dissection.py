@@ -3643,6 +3643,57 @@ class TestDissectMoqMi:
         assert rows == [['video1', '2']]
 
 
+class TestDissectSFrame:
+    '''SFrame (RFC 9605) headers, exported to the "sframe" dissector.'''
+    PACKETS = (
+        # Short form: KID 0 and CTR 0 in the config byte, a 16-byte tag.
+        bytes.fromhex('00aabbcc') + bytes(range(16)),
+        # X and Y set: a 2-byte Key ID (0x0123) then a 2-byte Counter (0x0405).
+        bytes.fromhex('9901230405') + b'\xee' + bytes(range(16)),
+        # Short KID 5 with a 1-byte Counter (0xff); too short for a 16-byte tag.
+        bytes.fromhex('58ff0102'),
+    )
+
+    def _capture(self, cmd_text2pcap, result_file, base_env):
+        text_path = result_file('sframe.txt')
+        capture_path = result_file('sframe.pcapng')
+        with open(text_path, 'w') as text_file:
+            for packet in self.PACKETS:
+                text_file.write('0000 ' + ' '.join(f'{b:02x}' for b in packet) + '\n\n')
+        subprocess.check_call((cmd_text2pcap, '-q', '-P', 'sframe', text_path, capture_path),
+                              env=base_env)
+        return capture_path
+
+    @staticmethod
+    def _fields(cmd_tshark, capture_path, test_env, extra, *fields):
+        command = [cmd_tshark, *extra, '-r', capture_path, '-T', 'fields']
+        for field in fields:
+            command.extend(('-e', field))
+        stdout = subprocess.check_output(command, encoding='utf-8', env=test_env)
+        return [line.split('\t') for line in stdout.splitlines()]
+
+    def test_sframe_rfc9605(self, cmd_text2pcap, cmd_tshark, result_file, base_env, test_env):
+        '''Key ID and Counter in the config byte or after it, Key ID first.'''
+        path = self._capture(cmd_text2pcap, result_file, base_env)
+        rows = self._fields(cmd_tshark, path, test_env, (), 'sframe.kid', 'sframe.ctr',
+                            'sframe.ciphertext', 'sframe.tag', '_ws.expert.message')
+        assert rows[0] == ['0', '0', 'aabbcc', bytes(range(16)).hex(), '']
+        assert rows[1] == ['291', '1029', 'ee', bytes(range(16)).hex(), '']
+        assert rows[2][:2] == ['5', '255']
+        assert 'SFrame is shorter than its header and tag' in rows[2][4]
+
+    def test_sframe_legacy(self, cmd_text2pcap, cmd_tshark, result_file, base_env, test_env):
+        '''The earlier layout libloc writes: Counter length, Counter, then Key ID.'''
+        path = self._capture(cmd_text2pcap, result_file, base_env)
+        rows = self._fields(cmd_tshark, path, test_env,
+                            ('-o', 'sframe.header_format:legacy',
+                             '-o', 'sframe.cipher_suite:0x0003'),
+                            'sframe.kid', 'sframe.ctr', 'sframe.tag')
+        # 0x58 asks for a 6-byte Counter here, so the last frame is truncated.
+        assert rows == [['0', '170', '0c0d0e0f'], ['1029', '291', '0c0d0e0f'],
+                        ['', '', '']]
+
+
 @pytest.mark.parametrize("pass_args", [(), ("-2",)], ids=["one-pass", "two-pass"])
 class TestDissectWebTransport:
     '''
