@@ -147,6 +147,8 @@ void proto_reg_handoff_moqt(void);
 
 #define MOQT_SETUP_AUTHORIZATION_TOKEN        0x03
 #define MOQT_SETUP_MAX_CONTROL_MESSAGE_SIZE   0x09
+/* draft-frindell-moq-moqpack-00 capability; 0x0d is libloc's provisional value. */
+#define MOQT_SETUP_MOQPACK                    0x0d
 #define MOQT_ERROR_DETAIL_REDIRECT            0x01
 #define MOQT_ERROR_DETAIL_UNSUPPORTED_PROPERTY 0x02
 
@@ -228,6 +230,9 @@ static int hf_moqt_namespace_field_length;
 static int hf_moqt_namespace_field;
 static int hf_moqt_track_name_length;
 static int hf_moqt_track_name;
+static int hf_moqt_moqpack_section_length;
+static int hf_moqt_moqpack_section;
+static int hf_moqt_moqpack_index;
 static int hf_moqt_object_track_namespace;
 static int hf_moqt_object_track_name;
 static int hf_moqt_parameter_count;
@@ -334,6 +339,7 @@ static expert_field ei_moqt_namespace_too_large;
 static expert_field ei_moqt_nonzero_padding;
 static expert_field ei_moqt_stream_head_missing;
 static expert_field ei_moqt_empty_properties;
+static expert_field ei_moqt_moqpack;
 static expert_field ei_moqt_object_id_overflow;
 
 static const val64_string moqt_stream_type_vals[] = {
@@ -350,6 +356,7 @@ static const val64_string moqt_setup_option_type_vals[] = {
     { 0x04, "MAX_AUTH_TOKEN_CACHE_SIZE" },
     { 0x05, "AUTHORITY" },
     { 0x07, "MOQT_IMPLEMENTATION" },
+    { MOQT_SETUP_MOQPACK, "MOQPACK" },
     { 0, NULL }
 };
 
@@ -374,6 +381,7 @@ static const val64_string moqt_draft16_setup_option_type_vals[] = {
     { 0x04, "MAX_AUTH_TOKEN_CACHE_SIZE" },
     { 0x05, "AUTHORITY" },
     { 0x07, "MOQT_IMPLEMENTATION" },
+    { MOQT_SETUP_MOQPACK, "MOQPACK" },
     { 0, NULL }
 };
 
@@ -387,6 +395,7 @@ static const val64_string moqt_draft22_setup_option_type_vals[] = {
     { 0x08, "MAX_REQUEST_UPDATES" },
     /* Setup Option identifiers are shared across drafts. */
     { MOQT_SETUP_MAX_CONTROL_MESSAGE_SIZE, "MAX_CONTROL_MESSAGE_SIZE" },
+    { MOQT_SETUP_MOQPACK, "MOQPACK" },
     { 0, NULL }
 };
 
@@ -823,6 +832,13 @@ typedef struct {
     wmem_map_t *by_track_alias;
     wmem_map_t *by_stream;
     moqt_binding_t *last_request;    /* exported PDUs, which have no stream */
+    /*
+     * MoQPack is in use once both endpoints' SETUPs offer it: bit 0 for the
+     * client, bit 1 for the server (exported PDUs count SETUPs instead).
+     */
+    unsigned moqpack_offers;
+    unsigned moqpack_setups;
+    uint32_t moqpack_frame;          /* 0: not in use */
 } moqt_session_t;
 
 /* A growable property list, for Object or Track Properties. */
@@ -844,7 +860,10 @@ typedef struct {
     wmem_array_t *namespace_fields;  /* of moqt_bytes_t, packet scope */
     moqt_bytes_t track_name_bytes;
     moqt_property_list_t properties;
+    bool moqpack_offered;            /* a SETUP with the MOQPACK option */
 } moqt_capture_t;
+
+static moqt_session_t *moqt_session_get(packet_info *pinfo);
 
 typedef struct {
     tvbuff_t *tvb;
@@ -1436,9 +1455,254 @@ moqt_dissect_track_name(moqt_cursor_t *cursor)
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* MoQPack                                                                   */
+/* ------------------------------------------------------------------------- */
+
+/* The MoQPack static table, as libloc defines it (static-only QPACK). */
+static const struct {
+    const char *name;
+    const char *value;
+} moqt_moqpack_table[] = {
+    { ":track", "" },     { ":ns", "" },         { ":path", "/" },     { ":path", "" },
+    { "codec", "opus" },  { "codec", "avc1" },   { "codec", "av01" },  { "codec", "vp09" },
+    { "codec", "hvc1" },  { "codec", "" },       { "layer", "0" },     { "layer", "1" },
+    { "layer", "2" },     { "layer", "" },       { "group", "" },      { "relay", "" },
+    { "bitrate", "" },    { "fps", "30" },       { "fps", "60" },      { "fps", "" },
+    { "resolution", "1080p" }, { "resolution", "720p" }, { "resolution", "480p" },
+    { "resolution", "" },
+};
+
+/* RFC 7541 section 5.1 prefixed integer; returns bytes used, 0 if bad. */
+static int
+moqt_qpack_int(tvbuff_t *tvb, int offset, int end, unsigned prefix_bits, uint64_t *value)
+{
+    uint64_t max = (UINT64_C(1) << prefix_bits) - 1;
+    int used = 1;
+    unsigned shift = 0;
+
+    if (offset >= end) {
+        return 0;
+    }
+    *value = tvb_get_uint8(tvb, offset) & max;
+    if (*value < max) {
+        return 1;
+    }
+    for (;;) {
+        uint8_t b;
+
+        if (offset + used >= end || shift > 56) {
+            return 0;
+        }
+        b = tvb_get_uint8(tvb, offset + used++);
+        *value += (uint64_t)(b & 0x7f) << shift;
+        shift += 7;
+        if ((b & 0x80) == 0) {
+            return used;
+        }
+    }
+}
+
+/* A string literal: H flag, a prefixed length, then raw or Huffman bytes. */
+static const char *
+moqt_qpack_string(packet_info *pinfo, tvbuff_t *tvb, int *offset, int end,
+                  unsigned prefix_bits)
+{
+    bool huffman = (tvb_get_uint8(tvb, *offset) >> prefix_bits) & 1;
+    uint64_t length;
+    int used = moqt_qpack_int(tvb, *offset, end, prefix_bits, &length);
+    const char *text;
+
+    if (used == 0 || length > (uint64_t)(end - *offset - used)) {
+        return NULL;
+    }
+    *offset += used;
+    if (huffman) {
+        wmem_strbuf_t *decoded = tvb_get_hpack_huffman_strbuf(pinfo->pool, tvb,
+                                                              *offset, (unsigned)length);
+
+        text = decoded ? wmem_strbuf_get_str(decoded) : NULL;
+    } else {
+        text = (const char *)tvb_get_string_enc(pinfo->pool, tvb, *offset, (int)length,
+                                                ENC_UTF_8);
+    }
+    *offset += (int)length;
+    return text;
+}
+
+/*
+ * One field section: Required Insert Count and Delta Base (both 0, since
+ * MoQPack has no dynamic table), then a single field line that is indexed,
+ * a literal with a static name reference, or a literal with a literal name.
+ */
+static bool
+moqt_moqpack_section(moqt_cursor_t *cursor, proto_tree *tree, int offset, int end,
+                     const char **name, const char **value)
+{
+    tvbuff_t *tvb = cursor->tvb;
+    uint64_t ric, base, index;
+    uint8_t first;
+    int used;
+
+    used = moqt_qpack_int(tvb, offset, end, 8, &ric);
+    if (used == 0 || ric != 0) {
+        return false;
+    }
+    offset += used;
+    used = moqt_qpack_int(tvb, offset, end, 7, &base);
+    if (used == 0 || base != 0 || offset + used >= end) {
+        return false;
+    }
+    offset += used;
+    first = tvb_get_uint8(tvb, offset);
+    if ((first & 0x80) != 0) {
+        /* Indexed field line; T must select the static table. */
+        if ((first & 0x40) == 0 || moqt_qpack_int(tvb, offset, end, 6, &index) == 0 ||
+            index >= array_length(moqt_moqpack_table)) {
+            return false;
+        }
+        *name = moqt_moqpack_table[index].name;
+        *value = moqt_moqpack_table[index].value;
+    } else if ((first & 0xc0) == 0x40) {
+        /* Literal with name reference. */
+        if ((first & 0x10) == 0) {
+            return false;
+        }
+        used = moqt_qpack_int(tvb, offset, end, 4, &index);
+        if (used == 0 || index >= array_length(moqt_moqpack_table)) {
+            return false;
+        }
+        offset += used;
+        if (offset >= end) {
+            return false;
+        }
+        *name = moqt_moqpack_table[index].name;
+        *value = moqt_qpack_string(cursor->pinfo, tvb, &offset, end, 7);
+    } else if ((first & 0xe0) == 0x20) {
+        /* Literal with literal name. */
+        index = UINT64_MAX;
+        *name = moqt_qpack_string(cursor->pinfo, tvb, &offset, end, 3);
+        *value = *name && offset < end
+                     ? moqt_qpack_string(cursor->pinfo, tvb, &offset, end, 7) : NULL;
+    } else {
+        return false;   /* post-base forms need a dynamic table */
+    }
+    if (!*name || !*value) {
+        return false;
+    }
+    if (index != UINT64_MAX) {
+        proto_item_set_generated(proto_tree_add_uint64(tree, hf_moqt_moqpack_index, tvb,
+                                                       offset, 0, index));
+    }
+    return true;
+}
+
+static bool
+moqt_moqpack_active(moqt_cursor_t *cursor)
+{
+    const moqt_session_t *session = moqt_session_get(cursor->pinfo);
+
+    return session->moqpack_frame != 0 && cursor->pinfo->num >= session->moqpack_frame;
+}
+
+/*
+ * A Full Track Name as MoQPack compresses it: the namespace field count,
+ * then for each field and for the track name a length and a field section
+ * (":ns" or ":track" with the bytes as its value).
+ */
+static void
+moqt_dissect_moqpack_full_track_name(moqt_cursor_t *cursor)
+{
+    proto_item *item;
+    proto_tree *tree;
+    wmem_strbuf_t *display = wmem_strbuf_new(cursor->pinfo->pool, "");
+    wmem_strbuf_t *raw = wmem_strbuf_new(cursor->pinfo->pool, "");
+    uint64_t count;
+    int start = cursor->offset;
+
+    tree = proto_tree_add_subtree(cursor->tree, cursor->tvb, start, -1, ett_moqt_namespace,
+                                  &item, "Full Track Name (MoQPack)");
+    {
+        moqt_cursor_t nested = *cursor;
+
+        nested.tree = tree;
+        if (!moqt_cursor_varint(&nested, hf_moqt_namespace_count, &count,
+                                "track namespace field count")) {
+            moqt_cursor_finish_nested(cursor, &nested);
+            return;
+        }
+        moqt_cursor_finish_nested(cursor, &nested);
+    }
+    if (cursor->capture) {
+        cursor->capture->namespace_fields =
+            wmem_array_new(cursor->pinfo->pool, sizeof(moqt_bytes_t));
+    }
+    for (uint64_t i = 0; i <= count && !cursor->failed; i++) {
+        bool is_name = i == count;
+        moqt_cursor_t section;
+        const char *name = NULL, *value = NULL;
+        proto_item *line;
+        proto_tree *line_tree;
+        tvbuff_t *value_tvb;
+        int length;
+
+        if (!moqt_cursor_block(cursor, hf_moqt_moqpack_section_length, &section,
+                               "MoQPack field section")) {
+            break;
+        }
+        line = proto_tree_add_item(tree, hf_moqt_moqpack_section, cursor->tvb,
+                                   section.offset, section.end - section.offset, ENC_NA);
+        line_tree = proto_item_add_subtree(line, ett_moqt_namespace);
+        if (!moqt_moqpack_section(cursor, line_tree, section.offset, section.end,
+                                  &name, &value)) {
+            expert_add_info(cursor->pinfo, line, &ei_moqt_moqpack);
+            continue;
+        }
+        proto_item_append_text(line, ": %s: %s", name, value);
+        if (strcmp(name, is_name ? ":track" : ":ns") != 0) {
+            expert_add_info_format(cursor->pinfo, line, &ei_moqt_moqpack,
+                                   "Expected a %s field line", is_name ? ":track" : ":ns");
+        }
+        /* The decoded bytes get the usual fields, so filters keep working. */
+        length = (int)strlen(value);
+        value_tvb = tvb_new_child_real_data(cursor->tvb, (const uint8_t *)value,
+                                            length, length);
+        add_new_data_source(cursor->pinfo, value_tvb, "MoQPack");
+        proto_tree_add_item(line_tree, is_name ? hf_moqt_track_name : hf_moqt_namespace_field,
+                            value_tvb, 0, length, ENC_NA);
+        if (is_name) {
+            proto_item_append_text(item, "%s%s", i ? " / " : ": ", value);
+            if (cursor->capture) {
+                cursor->capture->track_name = value;
+                cursor->capture->track_name_bytes =
+                    (moqt_bytes_t){ (const uint8_t *)value, (unsigned)length };
+            }
+        } else {
+            moqt_bytes_t field = { (const uint8_t *)value, (unsigned)length };
+
+            wmem_strbuf_append_printf(display, "%s%s", i ? "-" : "", value);
+            wmem_strbuf_append_printf(raw, "%s%s", i ? "/" : "", value);
+            if (cursor->capture) {
+                wmem_array_append_one(cursor->capture->namespace_fields, field);
+            }
+            if (i + 1 == count) {
+                proto_item_append_text(item, ": %s", wmem_strbuf_get_str(display));
+            }
+        }
+    }
+    if (cursor->capture && !cursor->failed) {
+        cursor->capture->track_namespace = wmem_strbuf_get_str(raw);
+    }
+    proto_item_set_len(item, cursor->offset - start);
+}
+
 static void
 moqt_dissect_full_track_name(moqt_cursor_t *cursor)
 {
+    if (cursor->phase == MOQT_DISSECT && moqt_moqpack_active(cursor)) {
+        moqt_dissect_moqpack_full_track_name(cursor);
+        return;
+    }
     moqt_dissect_namespace(cursor, "Track Namespace");
     moqt_dissect_track_name(cursor);
 }
@@ -2178,6 +2442,9 @@ moqt_dissect_kv_value(moqt_cursor_t *cursor, const moqt_kv_fields_t *fields,
             cursor->tvb, length_start, value.offset - length_start,
             "%s value length (%d) exceeds 65535 bytes",
             fields->entry_name, value_length);
+    }
+    if (kind == MOQT_KV_SETUP && type == MOQT_SETUP_MOQPACK && cursor->capture) {
+        cursor->capture->moqpack_offered = true;
     }
     if (kind == MOQT_KV_SETUP && type == MOQT_SETUP_AUTHORIZATION_TOKEN) {
         moqt_dissect_token(&value);
@@ -3129,6 +3396,18 @@ moqt_session_learn(moqt_cursor_t *cursor, const moqt_capture_t *capture)
     moqt_track_t *track = NULL;
     uint32_t frame = pinfo->num;
 
+    if (!PINFO_FD_VISITED(pinfo) && capture->moqpack_offered) {
+        session = moqt_session_get(pinfo);
+        if (cursor->stream_info) {
+            session->moqpack_offers |= cursor->stream_info->from_server ? 2u : 1u;
+        } else if (session->moqpack_setups < 2) {
+            session->moqpack_setups++;
+        }
+        if (!session->moqpack_frame &&
+            (session->moqpack_offers == 3 || session->moqpack_setups == 2)) {
+            session->moqpack_frame = frame;
+        }
+    }
     if (PINFO_FD_VISITED(pinfo) ||
         (!capture->track_alias_set &&
          !(capture->track_namespace && capture->track_name))) {
@@ -4824,6 +5103,19 @@ proto_register_moqt(void)
             FT_UINT64, BASE_DEC, NULL, 0x0,
             NULL, HFILL }
         },
+        { &hf_moqt_moqpack_section_length,
+          { "Field Section Length", "moqt.moqpack.length",
+            FT_UINT64, BASE_DEC, NULL, 0x0, NULL, HFILL }
+        },
+        { &hf_moqt_moqpack_section,
+          { "Field Section", "moqt.moqpack.section",
+            FT_BYTES, BASE_NONE, NULL, 0x0,
+            "A MoQPack (static-only QPACK) field section", HFILL }
+        },
+        { &hf_moqt_moqpack_index,
+          { "Static Table Index", "moqt.moqpack.index",
+            FT_UINT64, BASE_DEC, NULL, 0x0, NULL, HFILL }
+        },
         { &hf_moqt_object_track_namespace,
           { "Object Track Namespace", "moqt.object.track_namespace",
             FT_STRING, BASE_NONE, NULL, 0x0,
@@ -5277,6 +5569,10 @@ proto_register_moqt(void)
         { &ei_moqt_empty_properties,
           { "moqt.properties.empty", PI_PROTOCOL, PI_ERROR,
             "Properties bit set with an empty Properties field", EXPFILL }
+        },
+        { &ei_moqt_moqpack,
+          { "moqt.moqpack.bad", PI_MALFORMED, PI_ERROR,
+            "Malformed MoQPack field section", EXPFILL }
         },
         { &ei_moqt_object_id_overflow,
           { "moqt.object_id.overflow", PI_PROTOCOL, PI_ERROR,

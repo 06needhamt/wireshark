@@ -3144,6 +3144,54 @@ class TestDissectMoqt:
             cmd_tshark, capture_path, test_env,
             '_ws.malformed || _ws.expert.severity >= warning') == []
 
+    def test_moqt_moqpack(
+            self, cmd_text2pcap, cmd_tshark, result_file, base_env, test_env):
+        '''Once both SETUPs offer MOQPACK, Full Track Names are QPACK field sections.'''
+        vi = self._vi64
+        lp = lambda value: vi(len(value)) + value  # noqa: E731
+        section = lambda line: lp(b'\x00\x00' + line)  # noqa: E731
+        setup = self._message(0x2f00, self._key_values(((0x01, lp(b'/moq')),
+                                                         (0x0d, lp(b'')))))
+        # RFC 7541 C.4.1: "www.example.com" Huffman-coded.
+        huffman = bytes.fromhex('f1e3c2e5f23a6ba0ab90f4ff')
+        name_1 = (vi(2) + section(b'\x51\x04live') + section(b'\x51\x8c' + huffman) +
+                  section(b'\x50\x05video'))
+        # Indexed ":ns" "", a literal-named ":ns", and indexed ":track" "".
+        name_2 = (vi(2) + section(b'\xc1') + section(b'\x23:ns\x01a') + section(b'\xc0'))
+        # A dynamic table reference is not allowed.
+        name_3 = vi(1) + section(b'\x81') + section(b'\xc0')
+        packets = (
+            # A SUBSCRIBE before both endpoints have offered MoQPack.
+            setup,
+            self._message(0x03, vi(0) + self._namespace((b'plain',)) + vi(1) + b't' +
+                          self._parameters(())),
+            setup,
+            self._message(0x03, vi(2) + name_1 + self._parameters(())),
+            self._message(0x04, vi(9) + self._parameters(())),
+            self._message(0x03, vi(4) + name_2 + self._parameters(())),
+            self._message(0x03, vi(6) + name_3 + self._parameters(())),
+            # Track Alias 9, Group 0: one Object.
+            vi(0x30) + vi(9) + vi(0) + vi(0) + lp(b'x'),
+        )
+        capture_path = self._make_capture(
+            cmd_text2pcap, result_file, base_env, 'moqt-moqpack', 'moqt', packets)
+
+        for pass_args in ((), ('-2',)):
+            rows = self._field_rows(
+                cmd_tshark, capture_path, test_env, 'moqt',
+                ('moqt.setup.option.type', 'moqt.namespace.field', 'moqt.track_name',
+                 'moqt.moqpack.index', 'moqt.object.track_namespace',
+                 'moqt.object.track_name', '_ws.expert.message'),
+                extra_args=pass_args)
+            assert rows[1][1:3] == [b'plain'.hex(), b't'.hex()]
+            assert rows[3][1:5] == [b'live'.hex() + ',' + b'www.example.com'.hex(),
+                                    b'video'.hex(), '1,1,0', '']
+            # Empty values print as <MISSING>, as uncompressed ones do.
+            assert rows[5][1:4] == ['<MISSING>,' + b'a'.hex(), '<MISSING>', '1,0']
+            assert 'Malformed MoQPack field section' in rows[6][6]
+            assert rows[7][4:6] == ['live/www.example.com', 'video']
+            assert [row[0] for row in rows[:3:2]] == ['1,13', '1,13']
+
     def test_moqt_draft16_track_resolution(
             self, cmd_text2pcap, cmd_tshark, result_file,
             base_env, test_env):
